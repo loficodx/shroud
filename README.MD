@@ -654,3 +654,4 @@ For verbose logs:
 RUST_LOG=debug cargo run -p shroud-client -- configs/client.yaml
 RUST_LOG=debug cargo run -p shroud-server -- configs/server.yaml
 ```
+
