@@ -20,7 +20,13 @@ outbound:
   tls_ca_cert_path: "certs/ca.crt"
   multiplex: true
   multiplex_tunnels: 4
-  max_streams_per_tunnel: 16
+  min_tunnels: 4
+  max_tunnels: 12
+  max_streams_per_tunnel: 8
+  stream_slot_wait_timeout_ms: 2000
+  scale_up_writer_wait_ms: 100
+  scale_up_queue_depth_ratio: 0.75
+  scale_down_idle_secs: 60
   keepalive_interval_secs: 20
   keepalive_timeout_secs: 10
 

@@ -1,3 +1,4 @@
+use crate::protocol::MAX_FRAME_PAYLOAD_LEN;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -123,12 +124,30 @@ pub struct OutboundConfig {
     pub multiplex: bool,
     #[serde(default = "default_multiplex_tunnels")]
     pub multiplex_tunnels: usize,
+    #[serde(default)]
+    pub min_tunnels: Option<usize>,
+    #[serde(default)]
+    pub max_tunnels: Option<usize>,
     #[serde(default = "default_max_streams_per_tunnel")]
     pub max_streams_per_tunnel: usize,
+    #[serde(default = "default_stream_slot_wait_timeout_ms")]
+    pub stream_slot_wait_timeout_ms: u64,
+    #[serde(default = "default_scale_up_writer_wait_ms")]
+    pub scale_up_writer_wait_ms: u64,
+    #[serde(default = "default_scale_up_queue_depth_ratio")]
+    pub scale_up_queue_depth_ratio: f64,
+    #[serde(default = "default_scale_down_idle_secs")]
+    pub scale_down_idle_secs: u64,
     #[serde(default = "default_keepalive_interval_secs")]
     pub keepalive_interval_secs: u64,
     #[serde(default = "default_keepalive_timeout_secs")]
     pub keepalive_timeout_secs: u64,
+    #[serde(default = "default_max_buffer_per_stream_bytes")]
+    pub max_buffer_per_stream_bytes: usize,
+    #[serde(default = "default_max_buffer_per_tunnel_bytes")]
+    pub max_buffer_per_tunnel_bytes: usize,
+    #[serde(default = "default_max_pending_frames_per_stream")]
+    pub max_pending_frames_per_stream: usize,
 }
 
 impl Default for OutboundConfig {
@@ -142,10 +161,31 @@ impl Default for OutboundConfig {
             tls_ca_cert_path: None,
             multiplex: false,
             multiplex_tunnels: default_multiplex_tunnels(),
+            min_tunnels: None,
+            max_tunnels: None,
             max_streams_per_tunnel: default_max_streams_per_tunnel(),
+            stream_slot_wait_timeout_ms: default_stream_slot_wait_timeout_ms(),
+            scale_up_writer_wait_ms: default_scale_up_writer_wait_ms(),
+            scale_up_queue_depth_ratio: default_scale_up_queue_depth_ratio(),
+            scale_down_idle_secs: default_scale_down_idle_secs(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             keepalive_timeout_secs: default_keepalive_timeout_secs(),
+            max_buffer_per_stream_bytes: default_max_buffer_per_stream_bytes(),
+            max_buffer_per_tunnel_bytes: default_max_buffer_per_tunnel_bytes(),
+            max_pending_frames_per_stream: default_max_pending_frames_per_stream(),
         }
+    }
+}
+
+impl OutboundConfig {
+    pub fn effective_min_tunnels(&self) -> usize {
+        self.min_tunnels.unwrap_or(self.multiplex_tunnels).max(1)
+    }
+
+    pub fn effective_max_tunnels(&self) -> usize {
+        self.max_tunnels
+            .unwrap_or_else(|| self.effective_min_tunnels())
+            .max(1)
     }
 }
 
@@ -157,12 +197,40 @@ fn default_max_streams_per_tunnel() -> usize {
     16
 }
 
+fn default_stream_slot_wait_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_scale_up_writer_wait_ms() -> u64 {
+    100
+}
+
+fn default_scale_up_queue_depth_ratio() -> f64 {
+    0.75
+}
+
+fn default_scale_down_idle_secs() -> u64 {
+    60
+}
+
 fn default_keepalive_interval_secs() -> u64 {
     20
 }
 
 fn default_keepalive_timeout_secs() -> u64 {
     10
+}
+
+fn default_max_buffer_per_stream_bytes() -> usize {
+    1_048_576
+}
+
+fn default_max_buffer_per_tunnel_bytes() -> usize {
+    16_777_216
+}
+
+fn default_max_pending_frames_per_stream() -> usize {
+    64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -274,10 +342,27 @@ pub struct ServerTlsConfig {
     pub key_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerMultiplexConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_max_buffer_per_stream_bytes")]
+    pub max_buffer_per_stream_bytes: usize,
+    #[serde(default = "default_max_buffer_per_tunnel_bytes")]
+    pub max_buffer_per_tunnel_bytes: usize,
+    #[serde(default = "default_max_pending_frames_per_stream")]
+    pub max_pending_frames_per_stream: usize,
+}
+
+impl Default for ServerMultiplexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_buffer_per_stream_bytes: default_max_buffer_per_stream_bytes(),
+            max_buffer_per_tunnel_bytes: default_max_buffer_per_tunnel_bytes(),
+            max_pending_frames_per_stream: default_max_pending_frames_per_stream(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,6 +550,13 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     for (index, client) in config.clients.iter().enumerate() {
         validate_authorized_client_config(&mut errors, &format!("clients[{index}]"), client);
     }
+    validate_flow_control_config(
+        &mut errors,
+        "multiplex",
+        config.multiplex.max_buffer_per_stream_bytes,
+        config.multiplex.max_buffer_per_tunnel_bytes,
+        config.multiplex.max_pending_frames_per_stream,
+    );
 
     finish_validation(errors)
 }
@@ -511,9 +603,48 @@ fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &Outbo
             "must be greater than 0",
         ));
     }
+    if matches!(outbound.min_tunnels, Some(0)) {
+        errors.push(ConfigFieldError::new(
+            "outbound.min_tunnels",
+            "must be greater than 0",
+        ));
+    }
+    if matches!(outbound.max_tunnels, Some(0)) {
+        errors.push(ConfigFieldError::new(
+            "outbound.max_tunnels",
+            "must be greater than 0",
+        ));
+    }
+    if outbound.effective_max_tunnels() < outbound.effective_min_tunnels() {
+        errors.push(ConfigFieldError::new(
+            "outbound.max_tunnels",
+            "must be greater than or equal to outbound.min_tunnels",
+        ));
+    }
     if outbound.max_streams_per_tunnel == 0 {
         errors.push(ConfigFieldError::new(
             "outbound.max_streams_per_tunnel",
+            "must be greater than 0",
+        ));
+    }
+    if outbound.stream_slot_wait_timeout_ms == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.stream_slot_wait_timeout_ms",
+            "must be greater than 0",
+        ));
+    }
+    if !outbound.scale_up_queue_depth_ratio.is_finite()
+        || outbound.scale_up_queue_depth_ratio <= 0.0
+        || outbound.scale_up_queue_depth_ratio > 1.0
+    {
+        errors.push(ConfigFieldError::new(
+            "outbound.scale_up_queue_depth_ratio",
+            "must be greater than 0 and less than or equal to 1",
+        ));
+    }
+    if outbound.scale_down_idle_secs == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.scale_down_idle_secs",
             "must be greater than 0",
         ));
     }
@@ -526,6 +657,46 @@ fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &Outbo
     if outbound.keepalive_timeout_secs == 0 {
         errors.push(ConfigFieldError::new(
             "outbound.keepalive_timeout_secs",
+            "must be greater than 0",
+        ));
+    }
+    validate_flow_control_config(
+        errors,
+        "outbound",
+        outbound.max_buffer_per_stream_bytes,
+        outbound.max_buffer_per_tunnel_bytes,
+        outbound.max_pending_frames_per_stream,
+    );
+}
+
+fn validate_flow_control_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    max_buffer_per_stream_bytes: usize,
+    max_buffer_per_tunnel_bytes: usize,
+    max_pending_frames_per_stream: usize,
+) {
+    if max_buffer_per_stream_bytes < MAX_FRAME_PAYLOAD_LEN {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.max_buffer_per_stream_bytes"),
+            format!("must be at least {MAX_FRAME_PAYLOAD_LEN}"),
+        ));
+    }
+    if max_buffer_per_tunnel_bytes < MAX_FRAME_PAYLOAD_LEN {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.max_buffer_per_tunnel_bytes"),
+            format!("must be at least {MAX_FRAME_PAYLOAD_LEN}"),
+        ));
+    }
+    if max_buffer_per_tunnel_bytes < max_buffer_per_stream_bytes {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.max_buffer_per_tunnel_bytes"),
+            "must be greater than or equal to max_buffer_per_stream_bytes",
+        ));
+    }
+    if max_pending_frames_per_stream == 0 {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.max_pending_frames_per_stream"),
             "must be greater than 0",
         ));
     }
@@ -731,9 +902,20 @@ auth:
         let cfg: ClientConfig = serde_yaml::from_str(BASE_CLIENT_CONFIG).expect("parse config");
 
         assert_eq!(cfg.outbound.multiplex_tunnels, 4);
+        assert_eq!(cfg.outbound.min_tunnels, None);
+        assert_eq!(cfg.outbound.max_tunnels, None);
+        assert_eq!(cfg.outbound.effective_min_tunnels(), 4);
+        assert_eq!(cfg.outbound.effective_max_tunnels(), 4);
         assert_eq!(cfg.outbound.max_streams_per_tunnel, 16);
+        assert_eq!(cfg.outbound.stream_slot_wait_timeout_ms, 2_000);
+        assert_eq!(cfg.outbound.scale_up_writer_wait_ms, 100);
+        assert_eq!(cfg.outbound.scale_up_queue_depth_ratio, 0.75);
+        assert_eq!(cfg.outbound.scale_down_idle_secs, 60);
         assert_eq!(cfg.outbound.keepalive_interval_secs, 20);
         assert_eq!(cfg.outbound.keepalive_timeout_secs, 10);
+        assert_eq!(cfg.outbound.max_buffer_per_stream_bytes, 1_048_576);
+        assert_eq!(cfg.outbound.max_buffer_per_tunnel_bytes, 16_777_216);
+        assert_eq!(cfg.outbound.max_pending_frames_per_stream, 64);
     }
 
     #[test]

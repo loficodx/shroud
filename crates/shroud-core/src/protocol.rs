@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 16;
-pub const MAX_FRAME_PAYLOAD_LEN: usize = 64 * 1024;
+pub const MAX_FRAME_PAYLOAD_LEN: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

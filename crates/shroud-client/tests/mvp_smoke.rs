@@ -3,9 +3,10 @@ use shroud_client::routing::Router;
 use shroud_client::session::SessionCore;
 use shroud_client::socks5;
 use shroud_client::tunnel::TunnelClient;
+use shroud_client::tunnel_manager::TunnelPool;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
-    RoutingConfig, RoutingRule, ServerConfig, ServerTlsConfig,
+    RoutingConfig, RoutingRule, ServerConfig, ServerMultiplexConfig, ServerTlsConfig,
 };
 use shroud_core::protocol::{
     Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, PROTOCOL_VERSION,
@@ -197,6 +198,28 @@ async fn socks_udp_associate_relays_datagrams_through_tunnel() -> TestResult {
     assert_eq!(response.target_host, "127.0.0.1");
     assert_eq!(response.target_port, target.addr.port());
     assert_eq!(response.payload, Bytes::from_static(b"udp ping"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiplexed_socks_udp_associate_is_rejected_as_tcp_only_mvp() -> TestResult {
+    let server = start_multiplexed_tunnel_server().await?;
+    let client = start_multiplexed_socks_client(
+        server.addr,
+        RoutingConfig {
+            default: RouteAction::Proxy,
+            rules: vec![],
+        },
+        "/api/tunnel",
+        CLIENT_SECRET,
+    )
+    .await?;
+
+    let reply = socks_udp_associate_reply_code(client.addr).await?;
+    assert_eq!(
+        reply, 0x07,
+        "expected SOCKS command-not-supported reply for multiplexed UDP ASSOCIATE"
+    );
     Ok(())
 }
 
@@ -623,6 +646,34 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
     Ok(RunningTask { addr, handle })
 }
 
+async fn start_multiplexed_tunnel_server() -> TestResult<RunningTask> {
+    let addr = free_addr().await?;
+    let cfg = ServerConfig {
+        listen: addr,
+        tunnel_path: "/api/tunnel".to_string(),
+        web_root: "./web".to_string(),
+        tls: ServerTlsConfig {
+            enabled: true,
+            cert_path: Some(SERVER_CERT.to_string()),
+            key_path: Some(SERVER_KEY.to_string()),
+        },
+        multiplex: ServerMultiplexConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        clients: vec![AuthorizedClient {
+            client_id: CLIENT_ID.to_string(),
+            client_secret: CLIENT_SECRET.to_string(),
+        }],
+    };
+
+    let handle = tokio::spawn(async move {
+        let _ = web::serve(cfg).await;
+    });
+    wait_for_tcp(addr).await?;
+    Ok(RunningTask { addr, handle })
+}
+
 async fn start_socks_client(
     tunnel_addr: SocketAddr,
     routing: RoutingConfig,
@@ -653,6 +704,36 @@ async fn start_socks_client_with_dns(
         auth_config(client_secret),
     );
     let session = SessionCore::new(router, tunnel, dns);
+
+    let handle = tokio::spawn(async move {
+        let _ = socks5::serve(listen, session).await;
+    });
+    wait_for_tcp(listen).await?;
+    Ok(RunningTask {
+        addr: listen,
+        handle,
+    })
+}
+
+async fn start_multiplexed_socks_client(
+    tunnel_addr: SocketAddr,
+    routing: RoutingConfig,
+    tunnel_path: &str,
+    client_secret: &str,
+) -> TestResult<RunningTask> {
+    let listen = free_addr().await?;
+    let router = Router::new(routing);
+    let mut outbound = outbound_config(tunnel_addr, tunnel_path);
+    outbound.multiplex = true;
+    outbound.multiplex_tunnels = 1;
+    outbound.min_tunnels = Some(1);
+    outbound.max_tunnels = Some(1);
+
+    let auth = auth_config(client_secret);
+    let tunnel = TunnelClient::new(outbound.clone(), auth.clone());
+    let tunnel_pool = TunnelPool::connect(outbound, auth).await?;
+    let session =
+        SessionCore::new_multiplexed(router, tunnel, tunnel_pool, ClientDnsConfig::default());
 
     let handle = tokio::spawn(async move {
         let _ = socks5::serve(listen, session).await;
@@ -775,9 +856,18 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         tls_ca_cert_path: Some(CA_CERT.to_string()),
         multiplex: false,
         multiplex_tunnels: 4,
+        min_tunnels: None,
+        max_tunnels: None,
         max_streams_per_tunnel: 16,
+        stream_slot_wait_timeout_ms: 2_000,
+        scale_up_writer_wait_ms: 100,
+        scale_up_queue_depth_ratio: 0.75,
+        scale_down_idle_secs: 60,
         keepalive_interval_secs: 20,
         keepalive_timeout_secs: 10,
+        max_buffer_per_stream_bytes: 1_048_576,
+        max_buffer_per_tunnel_bytes: 16_777_216,
+        max_pending_frames_per_stream: 64,
     }
 }
 
@@ -791,9 +881,18 @@ fn outbound_config_plain(server_addr: SocketAddr, path: &str) -> OutboundConfig 
         tls_ca_cert_path: None,
         multiplex: false,
         multiplex_tunnels: 4,
+        min_tunnels: None,
+        max_tunnels: None,
         max_streams_per_tunnel: 16,
+        stream_slot_wait_timeout_ms: 2_000,
+        scale_up_writer_wait_ms: 100,
+        scale_up_queue_depth_ratio: 0.75,
+        scale_down_idle_secs: 60,
         keepalive_interval_secs: 20,
         keepalive_timeout_secs: 10,
+        max_buffer_per_stream_bytes: 1_048_576,
+        max_buffer_per_tunnel_bytes: 16_777_216,
+        max_pending_frames_per_stream: 64,
     }
 }
 
@@ -876,6 +975,25 @@ async fn socks_udp_associate(proxy_addr: SocketAddr) -> TestResult<(TcpStream, S
     assert_ne!(bind_addr.port(), 0, "SOCKS UDP bind port must be non-zero");
 
     Ok((stream, bind_addr))
+}
+
+async fn socks_udp_associate_reply_code(proxy_addr: SocketAddr) -> TestResult<u8> {
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+    let mut handshake = [0u8; 2];
+    stream.read_exact(&mut handshake).await?;
+    assert_eq!(handshake, [0x05, 0x00], "SOCKS handshake failed");
+
+    stream
+        .write_all(&build_socks_udp_associate_request("0.0.0.0", 0)?)
+        .await?;
+
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await?;
+    assert_eq!(reply[0], 0x05, "unexpected SOCKS reply version");
+    assert_eq!(reply[2], 0x00, "unexpected SOCKS reply reserved byte");
+    Ok(reply[1])
 }
 
 fn build_socks_connect_request(host: &str, port: u16) -> TestResult<Vec<u8>> {

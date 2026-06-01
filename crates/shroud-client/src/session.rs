@@ -1,7 +1,7 @@
 use crate::routing::Router;
 use crate::tunnel::{RelayStats, TunnelClient, TunnelOpenTimings, TunnelStream, UdpTunnel};
 use crate::tunnel_manager::{TunnelPool, TunnelStreamHandle};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
@@ -86,6 +86,10 @@ impl SessionCore {
         self.router.decide(target_host, target_port)
     }
 
+    pub fn supports_udp_associate(&self) -> bool {
+        self.tunnel_pool.is_none()
+    }
+
     pub async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpOpenResult> {
         let action = self.decide(target_host, target_port);
 
@@ -151,6 +155,10 @@ impl SessionCore {
     }
 
     pub async fn open_udp_tunnel(&self) -> Result<UdpTunnel> {
+        if !self.supports_udp_associate() {
+            bail!("SOCKS UDP ASSOCIATE is not supported in multiplexed TCP-only MVP mode");
+        }
+
         self.tunnel
             .open_udp_association()
             .await

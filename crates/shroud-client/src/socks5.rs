@@ -165,6 +165,11 @@ async fn handle_udp_associate(
     session: SessionCore,
     request: ConnectRequest,
 ) -> Result<()> {
+    if !session.supports_udp_associate() {
+        write_reply(&mut control_socket, ReplyCode::CommandNotSupported).await?;
+        bail!("SOCKS UDP ASSOCIATE is not supported while outbound multiplexing is enabled");
+    }
+
     let tcp_local_addr = control_socket
         .local_addr()
         .context("failed to inspect SOCKS TCP local address")?;

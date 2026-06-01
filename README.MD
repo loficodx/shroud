@@ -27,20 +27,20 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
   - HTTP/1.1 `Upgrade: shroud-tunnel`;
   - optional TLS;
   - custom framed protocol;
-  - max frame payload size: `64 KiB`;
+  - max frame payload size: `32 KiB`;
   - oversized frame rejection before payload allocation;
   - TCP stream frames;
   - UDP association and UDP datagram frames.
 - TCP multiplexing:
   - optional client-side `outbound.multiplex`;
   - optional server-side `multiplex.enabled`;
-  - configurable pool of persistent physical tunnels via `outbound.multiplex_tunnels`;
-  - per-tunnel stream soft limit via `outbound.max_streams_per_tunnel`;
+  - configurable dynamic pool of persistent physical tunnels via `outbound.min_tunnels` / `outbound.max_tunnels`;
+  - hard per-tunnel stream limit via `outbound.max_streams_per_tunnel`;
   - logical TCP streams use odd client-allocated `stream_id` values;
   - per-stream `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` dispatch;
   - client waits for server `TcpConnect` success before completing SOCKS `CONNECT`;
   - server-side stream state tracks client/target close direction and ignores late `TcpData` for closing streams;
-  - separate control/data writer queues prioritize connect, close, error and keepalive frames over data frames;
+  - separate control/data writer queues prioritize connect, error and keepalive frames while keeping `TcpClose` ordered with stream data;
   - pressure-aware tunnel selection uses active stream count plus recent writer wait;
   - client keepalive `Ping` / server `Pong` and reconnect of broken persistent tunnels;
   - active-stream, target, tunnel, close-reason and writer-queue pressure logging.
@@ -182,7 +182,13 @@ outbound:
   tls_ca_cert_path: "certs/ca.crt"
   multiplex: true
   multiplex_tunnels: 4
-  max_streams_per_tunnel: 16
+  min_tunnels: 4
+  max_tunnels: 12
+  max_streams_per_tunnel: 8
+  stream_slot_wait_timeout_ms: 2000
+  scale_up_writer_wait_ms: 100
+  scale_up_queue_depth_ratio: 0.75
+  scale_down_idle_secs: 60
   keepalive_interval_secs: 20
   keepalive_timeout_secs: 10
 
@@ -343,7 +349,13 @@ Enable it on the client:
 outbound:
   multiplex: true
   multiplex_tunnels: 4
-  max_streams_per_tunnel: 16
+  min_tunnels: 4
+  max_tunnels: 12
+  max_streams_per_tunnel: 8
+  stream_slot_wait_timeout_ms: 2000
+  scale_up_writer_wait_ms: 100
+  scale_up_queue_depth_ratio: 0.75
+  scale_down_idle_secs: 60
   keepalive_interval_secs: 20
   keepalive_timeout_secs: 10
 ```
@@ -358,20 +370,22 @@ multiplex:
 Current behavior:
 
 - applies to proxied SOCKS TCP connections;
-- uses `outbound.multiplex_tunnels` persistent physical tunnels per client process, defaulting to 4;
-- chooses a connected tunnel by pressure score: active streams plus recent writer wait, with `outbound.max_streams_per_tunnel` defaulting to 16 before fallback to the least-pressured connected tunnel;
+- uses `outbound.min_tunnels` persistent physical tunnels at startup, defaulting to `outbound.multiplex_tunnels`;
+- grows up to `outbound.max_tunnels` when connected tunnels are full or writer queues look congested;
+- enforces `outbound.max_streams_per_tunnel` as a hard slot limit and waits up to `outbound.stream_slot_wait_timeout_ms` for capacity when the pool cannot grow;
+- chooses a connected tunnel by pressure score: active streams plus recent writer wait;
 - creates logical streams with odd client-side `stream_id` values;
 - dispatches `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` per logical stream;
-- uses separate control/data writer queues so control frames are preferred over `TcpData`, with periodic control checks after bounded data bursts;
+- uses separate control/data writer queues so connect/error/keepalive frames are preferred over `TcpData`, with periodic control checks after bounded data bursts;
 - sends client keepalive `Ping` frames and reconnects a broken persistent tunnel while excluding disconnected tunnels from new stream selection;
 - logs active stream counts and writer-channel send waits when the writer queue is under pressure.
 
 Current limitations:
 
-- no multiplexed UDP associations;
+- multiplexed mode is TCP-only for the MVP: SOCKS5 `UDP ASSOCIATE` is rejected with `CommandNotSupported`;
 - no per-stream flow control yet.
 
-Because the server chooses either the multiplexed relay or the non-multiplexed relay for the tunnel path, SOCKS5 `UDP ASSOCIATE` currently requires the non-multiplexed server mode. Disable both `outbound.multiplex` and `multiplex.enabled` when testing UDP ASSOCIATE.
+Because the server chooses either the multiplexed relay or the non-multiplexed relay for the tunnel path, SOCKS5 `UDP ASSOCIATE` currently requires the non-multiplexed server mode. Disable both `outbound.multiplex` and `multiplex.enabled` when testing UDP ASSOCIATE. Browser QUIC/HTTP/3 traffic is not optimized by the multiplexed MVP; disable HTTP/3 when validating browser/video behavior over TCP.
 
 ### SOCKS5 UDP ASSOCIATE
 
@@ -543,7 +557,7 @@ The TUN smoke test is ignored by default because it requires Linux root privileg
 
 In non-multiplexed mode, each tunnel connection carries either one TCP stream or one UDP association.
 
-In multiplexed mode, each persistent tunnel connection carries multiple logical TCP streams. The client can open a pool of persistent tunnels and schedules new streams across connected tunnels. UDP associations are not multiplexed yet.
+In multiplexed mode, each persistent tunnel connection carries multiple logical TCP streams. The client can open a pool of persistent tunnels and schedules new streams across connected tunnels. UDP associations are intentionally rejected in this TCP-only MVP.
 
 Frame header:
 
@@ -570,7 +584,7 @@ Important frame types:
 Current hard limit:
 
 ```text
-MAX_FRAME_PAYLOAD_LEN = 64 KiB
+MAX_FRAME_PAYLOAD_LEN = 32 KiB
 ```
 
 ## Security notes
@@ -588,9 +602,9 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 ### MVP stabilization
 
 - Keep SOCKS5 TCP CONNECT as the main stable path.
-- Keep SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
+- Keep non-multiplexed SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
 - Continue stabilizing TCP multiplexing under browser/video workloads:
-  - benchmark `multiplex_tunnels=1/2/4/6` and tune defaults from measured writer waits;
+  - benchmark `min_tunnels` / `max_tunnels` / `max_streams_per_tunnel` combinations and tune defaults from measured writer waits;
   - track late/unknown `TcpData` frequency under load;
   - add per-stream or per-host throughput summaries where useful.
 - Keep HTTP/1.1 Upgrade transport until the TCP MVP is fully stable.

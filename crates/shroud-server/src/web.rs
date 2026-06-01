@@ -1,5 +1,5 @@
 use crate::auth::validate_auth;
-use crate::relay::{relay_multiplexed_tunnel, relay_tunnel};
+use crate::relay::{relay_multiplexed_tunnel_with_config, relay_tunnel};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -234,7 +234,7 @@ where
         "server HTTP upgrade accepted"
     );
     if cfg.multiplex.enabled {
-        relay_multiplexed_tunnel(stream, peer).await?;
+        relay_multiplexed_tunnel_with_config(stream, peer, cfg.multiplex.clone()).await?;
     } else {
         relay_tunnel(stream, peer).await?;
     }
