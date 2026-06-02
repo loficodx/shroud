@@ -23,7 +23,7 @@ SOCKS5 CONNECT
 
 ---
 
-## 0. Зафиксировать архитектурный scope
+## 0. ~~Зафиксировать архитектурный scope~~
 
 ### Что должно быть в MVP
 
@@ -62,7 +62,7 @@ HTTP/2 and HTTP/3 modes are reserved for future transports.
 
 ---
 
-## 1. Переименовать transport modes
+## 1. ~~Переименовать transport modes~~
 
 ### Текущая проблема
 
@@ -145,7 +145,11 @@ Http2,
 
 ---
 
-## 2. Удалить/отключить UDP из runtime path
+## 2. ~~Удалить/отключить UDP из runtime path~~
+
+Status: implemented for the active runtime path. SOCKS5 `UDP ASSOCIATE` is rejected with
+`CommandNotSupported`, client/server UDP relay code is removed, and UDP datagram protocol helpers
+are no longer part of the public core protocol API.
 
 ### Цель
 
@@ -217,7 +221,12 @@ enum UdpMode {
 
 ---
 
-## 3. Оставить TUN сбоку
+## 3. ~~Оставить TUN сбоку~~
+
+Status: verified. TUN remains a client inbound selected by `inbounds.tun.enabled`. It reuses
+`SessionCore` and the configured TCP transport, does not alter `raw_tcp`, does not affect server
+startup, and keeps smoltcp UDP disabled. The local Fake DNS UDP listener is TUN-only helper state,
+not the removed SOCKS/tunnel UDP relay path.
 
 ### Решение
 
@@ -232,7 +241,7 @@ enum UdpMode {
 ### Рекомендуемая структура
 
 ```yaml
-inbound:
+inbounds:
   socks:
     enabled: true
     listen: "127.0.0.1:1080"
@@ -258,7 +267,11 @@ TUN должен быть inbound-слоем, а не transport-слоем.
 
 ---
 
-## 4. Очистить конфиги
+## 4. ~~Очистить конфиги~~
+
+Status: implemented for checked-in runtime configs. Cleanup removes only config that no longer maps
+to the active runtime path, such as legacy multiplex settings and old transport mode names. TUN,
+DNS, routing, `tunnel_path`, and `web_root` stay because they are still used by the current code.
 
 ### Цель
 
@@ -267,7 +280,7 @@ TUN должен быть inbound-слоем, а не transport-слоем.
 ### Минимальный client config
 
 ```yaml
-inbound:
+inbounds:
   socks:
     listen: "127.0.0.1:1080"
 
@@ -280,14 +293,14 @@ transport:
   tls_ca_cert_path: "certs/ca.crt"
 
 auth:
-  key: "..."
+  client_id: "..."
+  client_secret: "..."
 ```
 
 ### Минимальный server config
 
 ```yaml
-server:
-  listen: "0.0.0.0:8443"
+listen: "0.0.0.0:8443"
 
 transport:
   modes:
@@ -298,8 +311,9 @@ tls:
   cert_path: "certs/server.crt"
   key_path: "certs/server.key"
 
-auth:
-  key: "..."
+clients:
+  - client_id: "..."
+    client_secret: "..."
 ```
 
 ### Что удалить из текущих конфигов
@@ -320,7 +334,7 @@ legacy outbound fields, если они уже не нужны
 
 ---
 
-## 5. Сделать заготовки под http2 и http3
+## ~~5. Сделать заготовки под http2 и http3~~
 
 ### Цель
 
@@ -382,7 +396,7 @@ impl Http2Transport {
 
 ---
 
-## 6. Сделать raw_tcp максимально простым
+## ~~6. Сделать raw_tcp максимально простым~~
 
 ### Target architecture
 
@@ -425,7 +439,11 @@ server:
 
 ---
 
-## 7. Исправить timeout relay
+## 7. ~~Исправить timeout relay~~
+
+Status: implemented for the active TCP relay path. Client-side SOCKS/direct relay and server-side
+`raw_tcp` relay use `copy_bidirectional_with_sizes` without a wall-clock wrapper. A real idle
+timeout can be added later as a separate byte-activity-aware relay primitive.
 
 ### Текущая проблема
 
@@ -987,11 +1005,11 @@ relay errors
 
 ### Этап 1 — Scope cleanup
 
-- [ ] Удалить/отключить UDP ASSOCIATE.
-- [ ] Убрать UDP из config.
-- [ ] Убрать UDP startup/listeners.
-- [ ] Оставить TUN отдельно и выключенным по умолчанию.
-- [ ] Удалить legacy multiplex fields из конфигов.
+- [x] Удалить/отключить UDP ASSOCIATE.
+- [x] Убрать UDP из config.
+- [x] Убрать UDP startup/listeners.
+- [x] Оставить TUN отдельно и выключенным по умолчанию.
+- [x] Удалить legacy multiplex fields из конфигов.
 - [ ] README: зафиксировать TCP CONNECT only MVP.
 
 ### Этап 2 — Naming refactor
@@ -1005,7 +1023,7 @@ relay errors
 
 ### Этап 3 — raw_tcp correctness
 
-- [ ] Убрать wall-clock timeout вокруг `copy_bidirectional`.
+- [x] Убрать wall-clock timeout вокруг `copy_bidirectional`.
 - [ ] Реализовать или отложить настоящий idle timeout.
 - [ ] Добавить sniff/read handshake timeout на сервере.
 - [ ] Добавить client connect/TLS/handshake timeouts.
@@ -1036,7 +1054,7 @@ relay errors
 - [ ] Parallel connections test.
 - [ ] Long-lived active connection test.
 - [ ] Idle timeout test.
-- [ ] Unsupported UDP ASSOCIATE test.
+- [x] Unsupported UDP ASSOCIATE test.
 
 ### Этап 7 — benchmark
 
@@ -1062,9 +1080,9 @@ relay errors
 `raw_tcp` можно считать готовым MVP, если:
 
 - [ ] SOCKS5 TCP CONNECT стабильно работает.
-- [ ] UDP ASSOCIATE корректно отклоняется.
+- [x] UDP ASSOCIATE корректно отклоняется.
 - [ ] Нет multiplexing/frame overhead в datapath.
-- [ ] Нет wall-clock timeout, который убивает активные соединения.
+- [x] Нет wall-clock timeout, который убивает активные соединения.
 - [ ] TLS connector не пересобирается на каждый request.
 - [ ] Есть timeout на connect/handshake/sniff.
 - [ ] Есть лимит concurrent connections.

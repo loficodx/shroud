@@ -1,13 +1,12 @@
 use crate::transport::tls::build_tls_client_config;
 use crate::transport::{BoxedIo, TcpTransport, TcpTransportConnect, TcpTransportMetrics};
-use crate::tunnel::TunnelClient;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::BoxFuture;
 use shroud_core::auth::compute_auth_tag_bytes;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 use shroud_core::tcp_handshake::{
-    ClientAuthProof, TcpConnectRequest, TcpConnectStatus, read_fast_connect_status,
-    write_fast_connect_request,
+    ClientAuthProof, TcpConnectRequest, TcpConnectStatus, read_raw_tcp_connect_status,
+    write_raw_tcp_connect_request,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,39 +16,34 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::debug;
 
-const FAST_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const FAST_TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const RAW_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RAW_TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-pub struct FastTcpTransport {
+pub struct RawTcpTransport {
     outbound: OutboundConfig,
     auth: ClientAuthConfig,
 }
 
-impl FastTcpTransport {
+impl RawTcpTransport {
     pub fn new(outbound: OutboundConfig, auth: ClientAuthConfig) -> Self {
-        Self { outbound, auth }
-    }
-
-    pub fn from_tunnel(tunnel: TunnelClient) -> Self {
-        let (outbound, auth) = tunnel.transport_parts();
         Self { outbound, auth }
     }
 }
 
-impl TcpTransport for FastTcpTransport {
+impl TcpTransport for RawTcpTransport {
     fn connect<'a>(
         &'a self,
         target_host: &'a str,
         target_port: u16,
     ) -> BoxFuture<'a, Result<TcpTransportConnect>> {
         Box::pin(async move {
-            connect_fast_tcp(&self.outbound, &self.auth, target_host, target_port).await
+            connect_raw_tcp(&self.outbound, &self.auth, target_host, target_port).await
         })
     }
 }
 
-pub async fn connect_fast_tcp(
+pub async fn connect_raw_tcp(
     outbound: &OutboundConfig,
     auth: &ClientAuthConfig,
     target_host: &str,
@@ -57,19 +51,19 @@ pub async fn connect_fast_tcp(
 ) -> Result<TcpTransportConnect> {
     let server_connect_started = Instant::now();
     let stream = timeout(
-        FAST_TCP_CONNECT_TIMEOUT,
+        RAW_TCP_CONNECT_TIMEOUT,
         TcpStream::connect((outbound.server.as_str(), outbound.port)),
     )
     .await
     .with_context(|| {
         format!(
-            "timed out connecting to fast_tcp endpoint {}:{}",
+            "timed out connecting to raw_tcp endpoint {}:{}",
             outbound.server, outbound.port
         )
     })?
     .with_context(|| {
         format!(
-            "failed to connect to fast_tcp endpoint {}:{}",
+            "failed to connect to raw_tcp endpoint {}:{}",
             outbound.server, outbound.port
         )
     })?;
@@ -77,7 +71,7 @@ pub async fn connect_fast_tcp(
 
     stream.set_nodelay(true).with_context(|| {
         format!(
-            "failed to enable TCP_NODELAY for fast_tcp endpoint {}:{}",
+            "failed to enable TCP_NODELAY for raw_tcp endpoint {}:{}",
             outbound.server, outbound.port
         )
     })?;
@@ -94,19 +88,19 @@ pub async fn connect_fast_tcp(
         let server_name = ServerName::try_from(server_name)
             .map_err(|err| anyhow!("invalid tls server name: {err}"))?;
         let tls_stream = timeout(
-            FAST_TCP_CONNECT_TIMEOUT,
+            RAW_TCP_CONNECT_TIMEOUT,
             connector.connect(server_name, stream),
         )
         .await
         .with_context(|| {
             format!(
-                "timed out establishing tls connection to fast_tcp endpoint {}:{}",
+                "timed out establishing tls connection to raw_tcp endpoint {}:{}",
                 outbound.server, outbound.port
             )
         })?
         .with_context(|| {
             format!(
-                "failed to establish tls connection to fast_tcp endpoint {}:{}",
+                "failed to establish tls connection to raw_tcp endpoint {}:{}",
                 outbound.server, outbound.port
             )
         })?;
@@ -120,23 +114,23 @@ pub async fn connect_fast_tcp(
     let req = TcpConnectRequest::new(target_host, target_port, build_auth_proof(auth)?);
     let target_connect_started = Instant::now();
     timeout(
-        FAST_TCP_HANDSHAKE_TIMEOUT,
-        write_fast_connect_request(&mut stream, &req),
+        RAW_TCP_HANDSHAKE_TIMEOUT,
+        write_raw_tcp_connect_request(&mut stream, &req),
     )
     .await
-    .context("timed out writing fast_tcp connect request")?
-    .context("failed to write fast_tcp connect request")?;
+    .context("timed out writing raw_tcp connect request")?
+    .context("failed to write raw_tcp connect request")?;
 
     let status = timeout(
-        FAST_TCP_HANDSHAKE_TIMEOUT,
-        read_fast_connect_status(&mut stream),
+        RAW_TCP_HANDSHAKE_TIMEOUT,
+        read_raw_tcp_connect_status(&mut stream),
     )
     .await
-    .context("timed out waiting for fast_tcp connect status")?
-    .context("failed to read fast_tcp connect status")?;
+    .context("timed out waiting for raw_tcp connect status")?
+    .context("failed to read raw_tcp connect status")?;
     let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
     if status != TcpConnectStatus::Ok {
-        bail!("fast_tcp connect rejected: {status}");
+        bail!("raw_tcp connect rejected: {status}");
     }
 
     debug!(
@@ -147,7 +141,7 @@ pub async fn connect_fast_tcp(
         server_tcp_connect_ms,
         tls_handshake_ms,
         target_tcp_connect_ms,
-        "fast_tcp connect accepted"
+        "raw_tcp connect accepted"
     );
 
     Ok(TcpTransportConnect {
@@ -173,7 +167,7 @@ fn build_auth_proof(auth: &ClientAuthConfig) -> Result<ClientAuthProof> {
         timestamp,
         &auth.client_id,
     )
-    .context("failed to compute fast_tcp auth tag")?;
+    .context("failed to compute raw_tcp auth tag")?;
 
     Ok(ClientAuthProof::new(
         auth.client_id.clone(),
@@ -191,7 +185,7 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
 mod tests {
     use super::*;
     use shroud_core::auth::compute_auth_tag_bytes;
-    use shroud_core::tcp_handshake::{read_fast_connect_request, write_fast_connect_status};
+    use shroud_core::tcp_handshake::{read_raw_tcp_connect_request, write_raw_tcp_connect_status};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -221,7 +215,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let req = read_fast_connect_request(&mut socket).await.unwrap();
+            let req = read_raw_tcp_connect_request(&mut socket).await.unwrap();
             assert_eq!(req.host, "example.com");
             assert_eq!(req.port, 443);
             assert_eq!(req.auth.client_id, CLIENT_ID);
@@ -234,7 +228,7 @@ mod tests {
             .unwrap();
             assert_eq!(req.auth.auth_tag, expected_tag);
 
-            write_fast_connect_status(&mut socket, TcpConnectStatus::Ok)
+            write_raw_tcp_connect_status(&mut socket, TcpConnectStatus::Ok)
                 .await
                 .unwrap();
 
@@ -245,7 +239,7 @@ mod tests {
         });
 
         let mut connected =
-            connect_fast_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
+            connect_raw_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
                 .await
                 .unwrap();
         assert!(connected.metrics.server_tcp_connect_ms.is_some());
@@ -266,16 +260,16 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let _req = read_fast_connect_request(&mut socket).await.unwrap();
-            write_fast_connect_status(&mut socket, TcpConnectStatus::AuthFailed)
+            let _req = read_raw_tcp_connect_request(&mut socket).await.unwrap();
+            write_raw_tcp_connect_status(&mut socket, TcpConnectStatus::AuthFailed)
                 .await
                 .unwrap();
         });
 
-        let err = match connect_fast_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
+        let err = match connect_raw_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
             .await
         {
-            Ok(_) => panic!("fast_tcp connect unexpectedly succeeded"),
+            Ok(_) => panic!("raw_tcp connect unexpectedly succeeded"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("auth_failed"));

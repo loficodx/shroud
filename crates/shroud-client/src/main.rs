@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use shroud_client::{routing, session, socks5, transport, tun, tunnel};
+use shroud_client::{routing, session, socks5, transport, tun};
 use shroud_core::config::{generate_client_credentials, load_client_config_yaml};
 use std::fs;
 use tracing::{info, warn};
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
         warn!(warning = %warning, "deprecated client transport config");
     }
     info!(
-        tcp_mode = ?cfg.transport.tcp_mode,
+        mode = ?cfg.transport.mode,
         server = %cfg.transport.server,
         port = cfg.transport.port,
         tls = cfg.transport.tls,
@@ -52,19 +52,10 @@ async fn main() -> Result<()> {
     let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
 
     if cfg.inbounds.tun.enabled {
-        let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
-        let tcp_transport = transport::build_tcp_transport(
-            cfg.transport.tcp_mode,
-            outbound.clone(),
-            cfg.auth.clone(),
-        )
-        .context("failed to build TCP transport")?;
-        let session = session::SessionCore::new_with_transport(
-            router,
-            tunnel,
-            tcp_transport,
-            cfg.dns.clone(),
-        );
+        let tcp_transport =
+            transport::build_tcp_transport(cfg.transport.mode, outbound.clone(), cfg.auth.clone())
+                .context("failed to build TCP transport")?;
+        let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone());
         let device = tun::device::open(&cfg.inbounds.tun)
             .with_context(|| format!("failed to set up TUN device {}", cfg.inbounds.tun.name))?;
         info!(
@@ -99,12 +90,10 @@ async fn main() -> Result<()> {
 
     info!(listen = %socks.listen, "starting shroud client");
 
-    let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
     let tcp_transport =
-        transport::build_tcp_transport(cfg.transport.tcp_mode, outbound.clone(), cfg.auth.clone())
+        transport::build_tcp_transport(cfg.transport.mode, outbound.clone(), cfg.auth.clone())
             .context("failed to build TCP transport")?;
-    let session =
-        session::SessionCore::new_with_transport(router, tunnel, tcp_transport, cfg.dns.clone());
+    let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone());
 
     socks5::serve(socks.listen, session).await
 }

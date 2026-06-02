@@ -1,11 +1,11 @@
-pub mod balanced_tcp;
-pub mod fast_tcp;
-pub mod http;
+pub mod http2;
+pub mod http3;
+pub mod raw_tcp;
 pub mod tls;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
-use shroud_core::config::{ClientAuthConfig, OutboundConfig, TcpTransportMode};
+use shroud_core::config::{ClientAuthConfig, OutboundConfig, TransportMode};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -36,14 +36,13 @@ pub trait TcpTransport: Send + Sync {
 }
 
 pub fn build_tcp_transport(
-    mode: TcpTransportMode,
+    mode: TransportMode,
     outbound: OutboundConfig,
     auth: ClientAuthConfig,
 ) -> Result<Arc<dyn TcpTransport>> {
     match mode {
-        TcpTransportMode::FastTcp => Ok(Arc::new(fast_tcp::FastTcpTransport::new(outbound, auth))),
-        TcpTransportMode::BalancedTcp => Ok(Arc::new(balanced_tcp::BalancedTcpTransport::new(
-            outbound, auth,
-        ))),
+        TransportMode::RawTcp => Ok(Arc::new(raw_tcp::RawTcpTransport::new(outbound, auth))),
+        TransportMode::Http2 => bail!("http2 transport is reserved but not implemented yet"),
+        TransportMode::Http3 => bail!("http3 transport is reserved but not implemented yet"),
     }
 }

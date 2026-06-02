@@ -196,21 +196,22 @@ impl OutboundConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TcpTransportMode {
-    FastTcp,
-    BalancedTcp,
+pub enum TransportMode {
+    RawTcp,
+    Http2,
+    Http3,
 }
 
-impl Default for TcpTransportMode {
+impl Default for TransportMode {
     fn default() -> Self {
-        default_tcp_mode()
+        default_mode()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
-    #[serde(default = "default_tcp_mode")]
-    pub tcp_mode: TcpTransportMode,
+    #[serde(default = "default_mode")]
+    pub mode: TransportMode,
     pub server: String,
     pub port: u16,
     #[serde(default = "default_true")]
@@ -226,7 +227,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            tcp_mode: default_tcp_mode(),
+            mode: default_mode(),
             server: String::new(),
             port: 0,
             tls: true,
@@ -240,7 +241,7 @@ impl Default for TransportConfig {
 impl TransportConfig {
     fn from_legacy_outbound(outbound: &OutboundConfig) -> Self {
         Self {
-            tcp_mode: default_tcp_mode(),
+            mode: default_mode(),
             server: outbound.server.clone(),
             port: outbound.port,
             tls: outbound.tls,
@@ -251,8 +252,8 @@ impl TransportConfig {
     }
 }
 
-fn default_tcp_mode() -> TcpTransportMode {
-    TcpTransportMode::FastTcp
+fn default_mode() -> TransportMode {
+    TransportMode::RawTcp
 }
 
 fn default_legacy_tunnel_path() -> String {
@@ -261,7 +262,7 @@ fn default_legacy_tunnel_path() -> String {
 
 fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
     let mut warnings = vec![
-        "outbound config is deprecated; use transport.tcp_mode, transport.server, and transport.port"
+        "outbound config is deprecated; use transport.mode, transport.server, and transport.port"
             .to_string(),
     ];
     if !outbound.path.is_empty() {
@@ -380,27 +381,20 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
-    #[serde(default = "default_server_tcp_modes")]
-    pub tcp_modes: Vec<TcpTransportMode>,
-    #[serde(default = "default_balanced_path")]
-    pub balanced_path: String,
+    #[serde(default = "default_server_modes")]
+    pub modes: Vec<TransportMode>,
 }
 
 impl Default for ServerTransportConfig {
     fn default() -> Self {
         Self {
-            tcp_modes: default_server_tcp_modes(),
-            balanced_path: default_balanced_path(),
+            modes: default_server_modes(),
         }
     }
 }
 
-fn default_server_tcp_modes() -> Vec<TcpTransportMode> {
-    vec![TcpTransportMode::FastTcp]
-}
-
-fn default_balanced_path() -> String {
-    "/api/v1/events".to_string()
+fn default_server_modes() -> Vec<TransportMode> {
+    vec![TransportMode::RawTcp]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -628,12 +622,6 @@ fn validate_transport_config(
             "port must be greater than 0",
         ));
     }
-    if transport.tcp_mode == TcpTransportMode::BalancedTcp && transport.path.is_none() {
-        errors.push(ConfigFieldError::new(
-            format!("{base_path}.path"),
-            "is required when tcp_mode=balanced_tcp",
-        ));
-    }
     if let Some(path) = &transport.path {
         validate_http_path(errors, &format!("{base_path}.path"), path);
     }
@@ -665,18 +653,24 @@ fn validate_server_transport_config(
     base_path: &str,
     transport: &ServerTransportConfig,
 ) {
-    if transport.tcp_modes.is_empty() {
+    if transport.modes.is_empty() {
         errors.push(ConfigFieldError::new(
-            format!("{base_path}.tcp_modes"),
+            format!("{base_path}.modes"),
             "must include at least one TCP transport mode",
         ));
     }
-    if transport.tcp_modes.contains(&TcpTransportMode::BalancedTcp) {
-        validate_http_path(
-            errors,
-            &format!("{base_path}.balanced_path"),
-            &transport.balanced_path,
-        );
+    for mode in &transport.modes {
+        match mode {
+            TransportMode::RawTcp => {}
+            TransportMode::Http2 => errors.push(ConfigFieldError::new(
+                format!("{base_path}.modes"),
+                "http2 transport is reserved but not implemented yet",
+            )),
+            TransportMode::Http3 => errors.push(ConfigFieldError::new(
+                format!("{base_path}.modes"),
+                "http3 transport is reserved but not implemented yet",
+            )),
+        }
     }
 }
 
@@ -904,7 +898,7 @@ auth:
 inbound:
   listen: "127.0.0.1:1080"
 transport:
-  tcp_mode: fast_tcp
+  mode: raw_tcp
   server: "127.0.0.1"
   port: 8443
   tls: true
@@ -914,10 +908,10 @@ auth:
 "#;
 
     #[test]
-    fn client_config_accepts_fast_tcp_transport_shape() {
+    fn client_config_accepts_raw_tcp_transport_shape() {
         let cfg = load_client_config_yaml(BASE_CLIENT_TRANSPORT_CONFIG).expect("valid config");
 
-        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::FastTcp);
+        assert_eq!(cfg.transport.mode, TransportMode::RawTcp);
         assert_eq!(cfg.transport.server, "127.0.0.1");
         assert_eq!(cfg.transport.port, 8443);
         assert!(cfg.transport.tls);
@@ -930,15 +924,15 @@ auth:
     }
 
     #[test]
-    fn client_config_accepts_balanced_tcp_transport_shape() {
+    fn client_config_accepts_http2_transport_shape() {
         let raw = BASE_CLIENT_TRANSPORT_CONFIG.replace(
-            "tcp_mode: fast_tcp\n  server",
-            "tcp_mode: balanced_tcp\n  path: \"/api/v1/events\"\n  server",
+            "mode: raw_tcp\n  server",
+            "mode: http2\n  path: \"/api/v1/events\"\n  server",
         );
 
         let cfg = load_client_config_yaml(&raw).expect("valid config");
 
-        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::BalancedTcp);
+        assert_eq!(cfg.transport.mode, TransportMode::Http2);
         assert_eq!(cfg.transport.path.as_deref(), Some("/api/v1/events"));
         assert_eq!(cfg.outbound.path, "/api/v1/events");
     }
@@ -947,7 +941,7 @@ auth:
     fn client_config_maps_legacy_outbound_to_transport_with_warnings() {
         let cfg = load_client_config_yaml(BASE_CLIENT_CONFIG).expect("valid config");
 
-        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::FastTcp);
+        assert_eq!(cfg.transport.mode, TransportMode::RawTcp);
         assert_eq!(cfg.transport.server, "127.0.0.1");
         assert_eq!(cfg.transport.port, 8443);
         assert_eq!(cfg.transport.path.as_deref(), Some("/api/tunnel"));
@@ -966,13 +960,12 @@ auth:
     }
 
     #[test]
-    fn client_config_rejects_balanced_tcp_without_path() {
-        let raw =
-            BASE_CLIENT_TRANSPORT_CONFIG.replace("tcp_mode: fast_tcp", "tcp_mode: balanced_tcp");
+    fn client_config_accepts_http3_as_reserved_transport_shape() {
+        let raw = BASE_CLIENT_TRANSPORT_CONFIG.replace("mode: raw_tcp", "mode: http3");
 
-        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
 
-        assert!(err.to_string().contains("transport.path"));
+        assert_eq!(cfg.transport.mode, TransportMode::Http3);
     }
 
     #[test]
@@ -982,10 +975,8 @@ listen: "127.0.0.1:8443"
 tunnel_path: "/api/tunnel"
 web_root: "."
 transport:
-  tcp_modes:
-    - fast_tcp
-    - balanced_tcp
-  balanced_path: "/api/v1/events"
+  modes:
+    - raw_tcp
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "secret"
@@ -993,11 +984,29 @@ clients:
 
         let cfg = load_server_config_yaml(raw).expect("valid config");
 
-        assert_eq!(
-            cfg.transport.tcp_modes,
-            vec![TcpTransportMode::FastTcp, TcpTransportMode::BalancedTcp]
-        );
-        assert_eq!(cfg.transport.balanced_path, "/api/v1/events");
+        assert_eq!(cfg.transport.modes, vec![TransportMode::RawTcp]);
+    }
+
+    #[test]
+    fn server_config_rejects_reserved_transport_modes() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+transport:
+  modes:
+    - raw_tcp
+    - http2
+    - http3
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("http2 transport is reserved"));
+        assert!(err.to_string().contains("http3 transport is reserved"));
     }
 
     #[test]

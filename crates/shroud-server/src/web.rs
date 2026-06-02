@@ -1,12 +1,12 @@
 use crate::auth::validate_auth;
 use crate::relay::relay_tunnel;
-use crate::transport::fast_tcp::{FastTcpServerState, handle_fast_tcp_connection};
+use crate::transport::raw_tcp::{RawTcpServerState, handle_raw_tcp_connection};
 use crate::transport::tls::build_tls_acceptor;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use shroud_core::config::{ServerConfig, TcpTransportMode};
-use shroud_core::tcp_handshake::FAST_TCP_MAGIC;
+use shroud_core::config::{ServerConfig, TransportMode};
+use shroud_core::tcp_handshake::RAW_TCP_MAGIC;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -34,7 +34,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
-    let fast_tcp_state = FastTcpServerState::new(cfg.clients.clone());
+    let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
     let mut active = JoinSet::new();
     info!(
         listen = %cfg.listen,
@@ -58,7 +58,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                 let cfg = cfg.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let nonce_cache = nonce_cache.clone();
-                let fast_tcp_state = fast_tcp_state.clone();
+                let raw_tcp_state = raw_tcp_state.clone();
 
                 active.spawn(async move {
                     let result = if let Some(acceptor) = tls_acceptor {
@@ -70,7 +70,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
                                     "server TLS handshake finished"
                                 );
-                                handle_connection(stream, peer, cfg, nonce_cache, fast_tcp_state).await
+                                handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
                             }
                             Err(err) => {
                                 debug!(
@@ -83,7 +83,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                             }
                         }
                     } else {
-                        handle_connection(stream, peer, cfg, nonce_cache, fast_tcp_state).await
+                        handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
                     };
 
                     if let Err(err) = result {
@@ -117,15 +117,15 @@ async fn handle_connection<S>(
     peer: std::net::SocketAddr,
     cfg: ServerConfig,
     nonce_cache: Arc<NonceCache>,
-    fast_tcp_state: FastTcpServerState,
+    raw_tcp_state: RawTcpServerState,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if cfg.transport.tcp_modes.contains(&TcpTransportMode::FastTcp) {
-        let (stream, is_fast_tcp) = sniff_fast_tcp_magic(stream).await?;
-        if is_fast_tcp {
-            return handle_fast_tcp_connection(stream, peer, fast_tcp_state).await;
+    if cfg.transport.modes.contains(&TransportMode::RawTcp) {
+        let (stream, is_raw_tcp) = sniff_raw_tcp_magic(stream).await?;
+        if is_raw_tcp {
+            return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
         }
 
         return handle_http_connection(stream, peer, cfg, nonce_cache).await;
@@ -170,17 +170,17 @@ where
     Ok(())
 }
 
-async fn sniff_fast_tcp_magic<S>(mut stream: S) -> Result<(PrefixedStream<S>, bool)>
+async fn sniff_raw_tcp_magic<S>(mut stream: S) -> Result<(PrefixedStream<S>, bool)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut prefix = [0u8; FAST_TCP_MAGIC.len()];
+    let mut prefix = [0u8; RAW_TCP_MAGIC.len()];
     stream
         .read_exact(&mut prefix)
         .await
         .context("failed to read connection prefix")?;
-    let is_fast_tcp = prefix == FAST_TCP_MAGIC;
-    Ok((PrefixedStream::new(stream, prefix.to_vec()), is_fast_tcp))
+    let is_raw_tcp = prefix == RAW_TCP_MAGIC;
+    Ok((PrefixedStream::new(stream, prefix.to_vec()), is_raw_tcp))
 }
 
 struct PrefixedStream<S> {
@@ -960,7 +960,7 @@ mod tests {
             }],
         };
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
-        let fast_tcp_state = FastTcpServerState::new(cfg.clients.clone());
+        let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
 
         let handle = tokio::spawn(async move {
             handle_connection(
@@ -968,7 +968,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
                 nonce_cache,
-                fast_tcp_state,
+                raw_tcp_state,
             )
             .await
         });

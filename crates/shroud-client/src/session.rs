@@ -1,7 +1,5 @@
 use crate::routing::Router;
-use crate::transport::fast_tcp::FastTcpTransport;
 use crate::transport::{BoxedIo, TcpTransport, TcpTransportMetrics};
-use crate::tunnel::{RelayStats, TunnelClient, UdpTunnel};
 use anyhow::{Context, Result};
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
@@ -13,32 +11,19 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 const DIRECT_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const COPY_BUF_SIZE: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct SessionCore {
     router: Router,
-    tunnel: TunnelClient,
     tcp_transport: Arc<dyn TcpTransport>,
     dns: ClientDnsConfig,
 }
 
 impl SessionCore {
-    pub fn new(router: Router, tunnel: TunnelClient, dns: ClientDnsConfig) -> Self {
-        let tcp_transport = Arc::new(FastTcpTransport::from_tunnel(tunnel.clone()));
-        Self::new_with_transport(router, tunnel, tcp_transport, dns)
-    }
-
-    pub fn new_with_transport(
-        router: Router,
-        tunnel: TunnelClient,
-        tcp_transport: Arc<dyn TcpTransport>,
-        dns: ClientDnsConfig,
-    ) -> Self {
+    pub fn new(router: Router, tcp_transport: Arc<dyn TcpTransport>, dns: ClientDnsConfig) -> Self {
         Self {
             router,
-            tunnel,
             tcp_transport,
             dns,
         }
@@ -81,10 +66,6 @@ impl SessionCore {
 
     pub fn decide(&self, target_host: &str, target_port: u16) -> RouteAction {
         self.router.decide(target_host, target_port)
-    }
-
-    pub fn supports_udp_associate(&self) -> bool {
-        true
     }
 
     pub async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpOpenResult> {
@@ -139,13 +120,6 @@ impl SessionCore {
         }
     }
 
-    pub async fn open_udp_tunnel(&self) -> Result<UdpTunnel> {
-        self.tunnel
-            .open_udp_association()
-            .await
-            .context("proxy UDP associate failed")
-    }
-
     pub async fn relay_tcp<S>(
         &self,
         client_stream: &mut S,
@@ -175,18 +149,15 @@ impl SessionCore {
         S: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
     {
-        let (client_to_upstream_bytes, upstream_to_client_bytes) = timeout(
-            RELAY_IDLE_TIMEOUT,
+        let (client_to_upstream_bytes, upstream_to_client_bytes) =
             tokio::io::copy_bidirectional_with_sizes(
                 client_stream,
                 upstream,
                 COPY_BUF_SIZE,
                 COPY_BUF_SIZE,
-            ),
-        )
-        .await
-        .context("relay idle timeout")?
-        .context("raw TCP relay failed")?;
+            )
+            .await
+            .context("raw TCP relay failed")?;
 
         Ok(RelayStats {
             client_to_upstream_bytes,
@@ -224,6 +195,27 @@ pub struct TcpOpenMetrics {
     pub tls_handshake_ms: Option<u64>,
     pub http_upgrade_ms: Option<u64>,
     pub target_tcp_connect_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RelayStats {
+    pub client_to_upstream_bytes: u64,
+    pub upstream_to_client_bytes: u64,
+}
+
+impl RelayStats {
+    pub fn total_bytes(self) -> u64 {
+        self.client_to_upstream_bytes + self.upstream_to_client_bytes
+    }
+
+    pub fn mbps(self, elapsed: Duration) -> f64 {
+        let seconds = elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            (self.total_bytes() as f64 * 8.0) / seconds / 1_000_000.0
+        } else {
+            0.0
+        }
+    }
 }
 
 impl From<TcpTransportMetrics> for TcpOpenMetrics {

@@ -1,15 +1,15 @@
-//! Binary handshake for `fast_tcp`.
+//! Binary handshake for `raw_tcp`.
 
 use crate::auth::AUTH_TAG_LEN;
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const FAST_TCP_MAGIC: [u8; 4] = *b"SHRD";
-pub const FAST_TCP_VERSION: u8 = 1;
-pub const FAST_TCP_COMMAND_CONNECT: u8 = 1;
-pub const MAX_FAST_TCP_AUTH_LEN: usize = u8::MAX as usize;
-pub const MAX_FAST_TCP_HOST_LEN: usize = u8::MAX as usize;
-pub const MAX_FAST_TCP_NONCE_LEN: usize = u8::MAX as usize;
+pub const RAW_TCP_MAGIC: [u8; 4] = *b"SHRD";
+pub const RAW_TCP_VERSION: u8 = 1;
+pub const RAW_TCP_COMMAND_CONNECT: u8 = 1;
+pub const MAX_RAW_TCP_AUTH_LEN: usize = u8::MAX as usize;
+pub const MAX_RAW_TCP_HOST_LEN: usize = u8::MAX as usize;
+pub const MAX_RAW_TCP_NONCE_LEN: usize = u8::MAX as usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAuthProof {
@@ -40,7 +40,7 @@ impl ClientAuthProof {
 
         let client_id = self.client_id.as_bytes();
         let encoded_len = 1 + client_id.len() + 8 + 1 + self.nonce.len() + AUTH_TAG_LEN;
-        if encoded_len > MAX_FAST_TCP_AUTH_LEN {
+        if encoded_len > MAX_RAW_TCP_AUTH_LEN {
             return Err(TcpHandshakeError::AuthTooLong(encoded_len));
         }
 
@@ -159,7 +159,7 @@ impl fmt::Display for TcpConnectStatus {
     }
 }
 
-pub async fn write_fast_connect_request<W>(
+pub async fn write_raw_tcp_connect_request<W>(
     writer: &mut W,
     req: &TcpConnectRequest,
 ) -> Result<(), TcpHandshakeError>
@@ -172,9 +172,9 @@ where
     let auth = req.auth.encode()?;
     let host = req.host.as_bytes();
 
-    writer.write_all(&FAST_TCP_MAGIC).await?;
-    writer.write_all(&[FAST_TCP_VERSION]).await?;
-    writer.write_all(&[FAST_TCP_COMMAND_CONNECT]).await?;
+    writer.write_all(&RAW_TCP_MAGIC).await?;
+    writer.write_all(&[RAW_TCP_VERSION]).await?;
+    writer.write_all(&[RAW_TCP_COMMAND_CONNECT]).await?;
     writer.write_all(&[auth.len() as u8]).await?;
     writer.write_all(&auth).await?;
     writer.write_all(&[host.len() as u8]).await?;
@@ -183,7 +183,7 @@ where
     Ok(())
 }
 
-pub async fn read_fast_connect_request<R>(
+pub async fn read_raw_tcp_connect_request<R>(
     reader: &mut R,
 ) -> Result<TcpConnectRequest, TcpHandshakeError>
 where
@@ -191,17 +191,17 @@ where
 {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).await?;
-    if magic != FAST_TCP_MAGIC {
+    if magic != RAW_TCP_MAGIC {
         return Err(TcpHandshakeError::InvalidMagic(magic));
     }
 
     let version = read_u8(reader).await?;
-    if version != FAST_TCP_VERSION {
+    if version != RAW_TCP_VERSION {
         return Err(TcpHandshakeError::UnsupportedVersion(version));
     }
 
     let command = read_u8(reader).await?;
-    if command != FAST_TCP_COMMAND_CONNECT {
+    if command != RAW_TCP_COMMAND_CONNECT {
         return Err(TcpHandshakeError::UnsupportedCommand(command));
     }
 
@@ -224,7 +224,7 @@ where
     Ok(TcpConnectRequest { host, port, auth })
 }
 
-pub async fn write_fast_connect_status<W>(
+pub async fn write_raw_tcp_connect_status<W>(
     writer: &mut W,
     status: TcpConnectStatus,
 ) -> Result<(), TcpHandshakeError>
@@ -235,7 +235,7 @@ where
     Ok(())
 }
 
-pub async fn read_fast_connect_status<R>(
+pub async fn read_raw_tcp_connect_status<R>(
     reader: &mut R,
 ) -> Result<TcpConnectStatus, TcpHandshakeError>
 where
@@ -258,7 +258,7 @@ fn validate_host(host: &str) -> Result<(), TcpHandshakeError> {
     if len == 0 {
         return Err(TcpHandshakeError::EmptyHost);
     }
-    if len > MAX_FAST_TCP_HOST_LEN {
+    if len > MAX_RAW_TCP_HOST_LEN {
         return Err(TcpHandshakeError::HostTooLong(len));
     }
     Ok(())
@@ -287,7 +287,7 @@ fn validate_nonce(nonce: &[u8]) -> Result<(), TcpHandshakeError> {
     if len == 0 {
         return Err(TcpHandshakeError::EmptyNonce);
     }
-    if len > MAX_FAST_TCP_NONCE_LEN {
+    if len > MAX_RAW_TCP_NONCE_LEN {
         return Err(TcpHandshakeError::NonceTooLong(len));
     }
     Ok(())
@@ -295,37 +295,37 @@ fn validate_nonce(nonce: &[u8]) -> Result<(), TcpHandshakeError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TcpHandshakeError {
-    #[error("invalid fast_tcp magic: {0:?}")]
+    #[error("invalid raw_tcp magic: {0:?}")]
     InvalidMagic([u8; 4]),
-    #[error("unsupported fast_tcp version: {0}")]
+    #[error("unsupported raw_tcp version: {0}")]
     UnsupportedVersion(u8),
-    #[error("unsupported fast_tcp command: {0}")]
+    #[error("unsupported raw_tcp command: {0}")]
     UnsupportedCommand(u8),
-    #[error("unknown fast_tcp status: {0:#04x}")]
+    #[error("unknown raw_tcp status: {0:#04x}")]
     UnknownStatus(u8),
-    #[error("fast_tcp auth proof too long: {0} bytes")]
+    #[error("raw_tcp auth proof too long: {0} bytes")]
     AuthTooLong(usize),
-    #[error("fast_tcp auth proof is invalid: {0}")]
+    #[error("raw_tcp auth proof is invalid: {0}")]
     InvalidAuthProof(&'static str),
-    #[error("fast_tcp client_id is empty")]
+    #[error("raw_tcp client_id is empty")]
     EmptyClientId,
-    #[error("fast_tcp client_id is not valid utf-8")]
+    #[error("raw_tcp client_id is not valid utf-8")]
     InvalidClientIdUtf8,
-    #[error("fast_tcp client_id is too long: {0} bytes")]
+    #[error("raw_tcp client_id is too long: {0} bytes")]
     ClientIdTooLong(usize),
-    #[error("fast_tcp nonce is empty")]
+    #[error("raw_tcp nonce is empty")]
     EmptyNonce,
-    #[error("fast_tcp nonce is too long: {0} bytes")]
+    #[error("raw_tcp nonce is too long: {0} bytes")]
     NonceTooLong(usize),
-    #[error("fast_tcp host is empty")]
+    #[error("raw_tcp host is empty")]
     EmptyHost,
-    #[error("fast_tcp host is not valid utf-8")]
+    #[error("raw_tcp host is not valid utf-8")]
     InvalidHostUtf8,
-    #[error("fast_tcp host is too long: {0} bytes")]
+    #[error("raw_tcp host is too long: {0} bytes")]
     HostTooLong(usize),
-    #[error("fast_tcp port is invalid: {0}")]
+    #[error("raw_tcp port is invalid: {0}")]
     InvalidPort(u16),
-    #[error("fast_tcp handshake IO error: {0}")]
+    #[error("raw_tcp handshake IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -345,9 +345,9 @@ mod tests {
 
     async fn roundtrip(req: TcpConnectRequest) -> Result<TcpConnectRequest, TcpHandshakeError> {
         let mut bytes = Vec::new();
-        write_fast_connect_request(&mut bytes, &req).await?;
+        write_raw_tcp_connect_request(&mut bytes, &req).await?;
         let mut reader = bytes.as_slice();
-        read_fast_connect_request(&mut reader).await
+        read_raw_tcp_connect_request(&mut reader).await
     }
 
     #[tokio::test]
@@ -371,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_too_long_host() {
-        let req = TcpConnectRequest::new("a".repeat(MAX_FAST_TCP_HOST_LEN + 1), 443, proof());
+        let req = TcpConnectRequest::new("a".repeat(MAX_RAW_TCP_HOST_LEN + 1), 443, proof());
         let err = roundtrip(req).await.unwrap_err();
         assert!(matches!(err, TcpHandshakeError::HostTooLong(256)));
     }
@@ -386,19 +386,19 @@ mod tests {
     #[tokio::test]
     async fn roundtrips_auth_failed_status() {
         let mut bytes = Vec::new();
-        write_fast_connect_status(&mut bytes, TcpConnectStatus::AuthFailed)
+        write_raw_tcp_connect_status(&mut bytes, TcpConnectStatus::AuthFailed)
             .await
             .unwrap();
 
         let mut reader = bytes.as_slice();
-        let status = read_fast_connect_status(&mut reader).await.unwrap();
+        let status = read_raw_tcp_connect_status(&mut reader).await.unwrap();
         assert_eq!(status, TcpConnectStatus::AuthFailed);
     }
 
     #[tokio::test]
     async fn partial_read_fails_safely() {
         let mut bytes = Vec::new();
-        write_fast_connect_request(
+        write_raw_tcp_connect_request(
             &mut bytes,
             &TcpConnectRequest::new("example.com", 443, proof()),
         )
@@ -407,14 +407,14 @@ mod tests {
         bytes.truncate(bytes.len() - 1);
 
         let mut reader = bytes.as_slice();
-        let err = read_fast_connect_request(&mut reader).await.unwrap_err();
+        let err = read_raw_tcp_connect_request(&mut reader).await.unwrap_err();
         assert!(matches!(err, TcpHandshakeError::Io(_)));
     }
 
     #[tokio::test]
     async fn rejects_unknown_status() {
         let mut reader = [0xff].as_slice();
-        let err = read_fast_connect_status(&mut reader).await.unwrap_err();
+        let err = read_raw_tcp_connect_status(&mut reader).await.unwrap_err();
         assert!(matches!(err, TcpHandshakeError::UnknownStatus(0xff)));
     }
 
@@ -422,16 +422,16 @@ mod tests {
     async fn rejects_partial_status_read() {
         let (client, mut server) = tokio::io::duplex(1);
         drop(client);
-        let err = read_fast_connect_status(&mut server).await.unwrap_err();
+        let err = read_raw_tcp_connect_status(&mut server).await.unwrap_err();
         assert!(matches!(err, TcpHandshakeError::Io(_)));
     }
 
     #[tokio::test]
     async fn rejects_malformed_auth_proof() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&FAST_TCP_MAGIC);
-        bytes.push(FAST_TCP_VERSION);
-        bytes.push(FAST_TCP_COMMAND_CONNECT);
+        bytes.extend_from_slice(&RAW_TCP_MAGIC);
+        bytes.push(RAW_TCP_VERSION);
+        bytes.push(RAW_TCP_COMMAND_CONNECT);
         bytes.push(1);
         bytes.push(0);
         bytes.push(11);
@@ -439,7 +439,7 @@ mod tests {
         bytes.extend_from_slice(&443u16.to_be_bytes());
 
         let mut reader = bytes.as_slice();
-        let err = read_fast_connect_request(&mut reader).await.unwrap_err();
+        let err = read_raw_tcp_connect_request(&mut reader).await.unwrap_err();
         assert!(matches!(err, TcpHandshakeError::EmptyClientId));
     }
 
@@ -447,13 +447,13 @@ mod tests {
     async fn write_status_flushes_single_byte() {
         let (mut client, mut server) = tokio::io::duplex(1);
         let writer = tokio::spawn(async move {
-            write_fast_connect_status(&mut client, TcpConnectStatus::Forbidden)
+            write_raw_tcp_connect_status(&mut client, TcpConnectStatus::Forbidden)
                 .await
                 .unwrap();
             client.shutdown().await.unwrap();
         });
 
-        let status = read_fast_connect_status(&mut server).await.unwrap();
+        let status = read_raw_tcp_connect_status(&mut server).await.unwrap();
         writer.await.unwrap();
         assert_eq!(status, TcpConnectStatus::Forbidden);
     }

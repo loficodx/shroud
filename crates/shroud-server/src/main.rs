@@ -24,8 +24,7 @@ async fn main() -> Result<()> {
 
     info!(
         listen = %cfg.listen,
-        tcp_modes = ?cfg.transport.tcp_modes,
-        balanced_path = %cfg.transport.balanced_path,
+        modes = ?cfg.transport.modes,
         "starting shroud server"
     );
     web::serve(cfg).await

@@ -4,12 +4,12 @@ use futures_util::future::BoxFuture;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 
 #[derive(Clone)]
-pub struct BalancedTcpTransport {
+pub struct Http2Transport {
     _outbound: OutboundConfig,
     _auth: ClientAuthConfig,
 }
 
-impl BalancedTcpTransport {
+impl Http2Transport {
     pub fn new(outbound: OutboundConfig, auth: ClientAuthConfig) -> Self {
         Self {
             _outbound: outbound,
@@ -18,12 +18,12 @@ impl BalancedTcpTransport {
     }
 }
 
-impl TcpTransport for BalancedTcpTransport {
+impl TcpTransport for Http2Transport {
     fn connect<'a>(
         &'a self,
         _target_host: &'a str,
         _target_port: u16,
     ) -> BoxFuture<'a, Result<TcpTransportConnect>> {
-        Box::pin(async move { bail!("balanced_tcp transport is not implemented yet") })
+        Box::pin(async move { bail!("http2 transport is not implemented yet") })
     }
 }
