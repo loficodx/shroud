@@ -33,6 +33,29 @@ pub fn validate_auth(
     constant_time_eq(&expected_tag, &presented_tag)
 }
 
+pub fn validate_auth_bytes(
+    known_clients: &[AuthorizedClient],
+    client_id: &str,
+    nonce: &[u8],
+    timestamp: i64,
+    presented_tag: &[u8; AUTH_TAG_LEN],
+) -> bool {
+    let Some(client) = known_clients.iter().find(|it| it.client_id == client_id) else {
+        return false;
+    };
+
+    let Ok(expected_tag) = compute_auth_tag_bytes(
+        client.client_secret.as_bytes(),
+        nonce,
+        timestamp,
+        &client.client_id,
+    ) else {
+        return false;
+    };
+
+    constant_time_eq(&expected_tag, presented_tag)
+}
+
 fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
     if expected.len() != presented.len() {
         return false;
@@ -95,6 +118,22 @@ mod tests {
             compute_auth_tag(b"wrong-secret", &nonce, timestamp, CLIENT_ID).expect("compute tag");
 
         assert!(!validate_auth(
+            &clients(),
+            CLIENT_ID,
+            &nonce,
+            timestamp,
+            &tag
+        ));
+    }
+
+    #[test]
+    fn validates_correct_hmac_bytes() {
+        let nonce = [7u8; 16];
+        let timestamp = 1_800_000_000;
+        let tag = compute_auth_tag_bytes(CLIENT_SECRET.as_bytes(), &nonce, timestamp, CLIENT_ID)
+            .expect("compute tag");
+
+        assert!(validate_auth_bytes(
             &clients(),
             CLIENT_ID,
             &nonce,

@@ -12,9 +12,6 @@ pub const MAX_FRAME_PAYLOAD_LEN: usize = 32 * 1024;
 pub enum FrameType {
     AuthChallenge = 0x01,
     AuthResponse = 0x02,
-    TcpConnect = 0x10,
-    TcpData = 0x11,
-    TcpClose = 0x12,
     UdpDatagram = 0x30,
     UdpAssociateRequest = 0x31,
     UdpAssociateResponse = 0x32,
@@ -30,9 +27,6 @@ impl TryFrom<u8> for FrameType {
         let frame_type = match value {
             0x01 => Self::AuthChallenge,
             0x02 => Self::AuthResponse,
-            0x10 => Self::TcpConnect,
-            0x11 => Self::TcpData,
-            0x12 => Self::TcpClose,
             0x30 => Self::UdpDatagram,
             0x31 => Self::UdpAssociateRequest,
             0x32 => Self::UdpAssociateResponse,
@@ -47,14 +41,6 @@ impl TryFrom<u8> for FrameType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    pub frame_type: FrameType,
-    pub stream_id: u64,
-    pub flags: u16,
-    pub payload: Bytes,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameCommand {
     pub frame_type: FrameType,
     pub stream_id: u64,
     pub flags: u16,
@@ -207,8 +193,6 @@ pub enum ProtocolError {
     PayloadLengthMismatch { expected: usize, got: usize },
     #[error("frame payload too large: max={max}, got={got}")]
     FramePayloadTooLarge { max: usize, got: usize },
-    #[error("invalid connect payload: {0}")]
-    InvalidConnectPayload(&'static str),
     #[error("invalid udp datagram payload: {0}")]
     InvalidUdpDatagramPayload(&'static str),
     #[error("invalid udp associate response payload: {0}")]
@@ -226,9 +210,6 @@ impl fmt::Display for FrameType {
         match self {
             Self::AuthChallenge => write!(f, "AUTH_CHALLENGE"),
             Self::AuthResponse => write!(f, "AUTH_RESPONSE"),
-            Self::TcpConnect => write!(f, "TCP_CONNECT"),
-            Self::TcpData => write!(f, "TCP_DATA"),
-            Self::TcpClose => write!(f, "TCP_CLOSE"),
             Self::UdpDatagram => write!(f, "UDP_DATAGRAM"),
             Self::UdpAssociateRequest => write!(f, "UDP_ASSOCIATE_REQUEST"),
             Self::UdpAssociateResponse => write!(f, "UDP_ASSOCIATE_RESPONSE"),
@@ -248,31 +229,6 @@ pub struct UdpDatagram {
 }
 
 const UDP_DATAGRAM_ASSOCIATION_ID_FLAG: u8 = 0x01;
-
-pub fn encode_tcp_connect_payload(host: &str, port: u16) -> Result<Bytes, ProtocolError> {
-    let mut payload = BytesMut::new();
-
-    encode_target_addr(host, &mut payload)?;
-    payload.put_u16(port);
-    Ok(payload.freeze())
-}
-
-pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), ProtocolError> {
-    if payload.len() < 3 {
-        return Err(ProtocolError::InvalidConnectPayload("payload too short"));
-    }
-
-    let (host, cursor) = decode_target_addr(payload, 0, ProtocolError::InvalidConnectPayload)?;
-
-    if payload.len() != cursor + 2 {
-        return Err(ProtocolError::InvalidConnectPayload(
-            "payload has unexpected trailing bytes",
-        ));
-    }
-
-    let port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
-    Ok((host, port))
-}
 
 pub fn encode_udp_associate_response_payload(
     bind_host: &str,
@@ -487,7 +443,7 @@ mod tests {
 
         write_frame(
             &mut writer,
-            FrameType::TcpData,
+            FrameType::UdpDatagram,
             7,
             0x0002,
             Bytes::from_static(b"payload"),
@@ -497,7 +453,7 @@ mod tests {
 
         let decoded = read_frame(&mut reader).await.expect("read frame");
 
-        assert_eq!(decoded.frame_type, FrameType::TcpData);
+        assert_eq!(decoded.frame_type, FrameType::UdpDatagram);
         assert_eq!(decoded.stream_id, 7);
         assert_eq!(decoded.flags, 0x0002);
         assert_eq!(decoded.payload, Bytes::from_static(b"payload"));
@@ -508,7 +464,7 @@ mod tests {
         let (mut writer, _reader) = tokio::io::duplex(1024);
         let payload = Bytes::from(vec![0u8; MAX_FRAME_PAYLOAD_LEN + 1]);
 
-        let err = write_frame(&mut writer, FrameType::TcpData, 1, 0, payload)
+        let err = write_frame(&mut writer, FrameType::UdpDatagram, 1, 0, payload)
             .await
             .expect_err("oversized frame must fail");
 
@@ -519,7 +475,7 @@ mod tests {
     fn decode_rejects_oversized_payload_length() {
         let mut encoded = BytesMut::with_capacity(HEADER_LEN);
         encoded.put_u8(PROTOCOL_VERSION);
-        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u8(FrameType::UdpDatagram as u8);
         encoded.put_u64(1);
         encoded.put_u16(0);
         encoded.put_u32((MAX_FRAME_PAYLOAD_LEN + 1) as u32);
@@ -539,7 +495,7 @@ mod tests {
     fn decode_rejects_truncated_payload() {
         let mut encoded = BytesMut::with_capacity(HEADER_LEN + 2);
         encoded.put_u8(PROTOCOL_VERSION);
-        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u8(FrameType::UdpDatagram as u8);
         encoded.put_u64(1);
         encoded.put_u16(0);
         encoded.put_u32(3);
@@ -559,7 +515,7 @@ mod tests {
     fn decode_rejects_payload_length_with_trailing_bytes() {
         let mut encoded = BytesMut::with_capacity(HEADER_LEN + 3);
         encoded.put_u8(PROTOCOL_VERSION);
-        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u8(FrameType::UdpDatagram as u8);
         encoded.put_u64(1);
         encoded.put_u16(0);
         encoded.put_u32(2);
@@ -573,22 +529,6 @@ mod tests {
                 got: 3
             }
         ));
-    }
-
-    #[test]
-    fn roundtrip_connect_payload_domain() {
-        let payload = encode_tcp_connect_payload("example.com", 443).expect("encode");
-        let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn roundtrip_connect_payload_ipv4() {
-        let payload = encode_tcp_connect_payload("127.0.0.1", 8080).expect("encode");
-        let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
     }
 
     #[test]

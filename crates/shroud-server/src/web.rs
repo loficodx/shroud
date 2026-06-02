@@ -1,25 +1,26 @@
 use crate::auth::validate_auth;
-use crate::relay::{relay_multiplexed_tunnel_with_config, relay_tunnel};
+use crate::relay::relay_tunnel;
+use crate::transport::fast_tcp::{FastTcpServerState, handle_fast_tcp_connection};
+use crate::transport::tls::build_tls_acceptor;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use shroud_core::config::{ServerConfig, ServerTlsConfig};
+use shroud_core::config::{ServerConfig, TcpTransportMode};
+use shroud_core::tcp_handshake::FAST_TCP_MAGIC;
 use std::collections::HashMap;
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::BufReader;
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, info};
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
@@ -33,11 +34,11 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
+    let fast_tcp_state = FastTcpServerState::new(cfg.clients.clone());
     let mut active = JoinSet::new();
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
-        multiplex = cfg.multiplex.enabled,
         "server listener started"
     );
 
@@ -57,6 +58,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                 let cfg = cfg.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let nonce_cache = nonce_cache.clone();
+                let fast_tcp_state = fast_tcp_state.clone();
 
                 active.spawn(async move {
                     let result = if let Some(acceptor) = tls_acceptor {
@@ -68,7 +70,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
                                     "server TLS handshake finished"
                                 );
-                                handle_connection(stream, peer, cfg, nonce_cache).await
+                                handle_connection(stream, peer, cfg, nonce_cache, fast_tcp_state).await
                             }
                             Err(err) => {
                                 debug!(
@@ -81,7 +83,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                             }
                         }
                     } else {
-                        handle_connection(stream, peer, cfg, nonce_cache).await
+                        handle_connection(stream, peer, cfg, nonce_cache, fast_tcp_state).await
                     };
 
                     if let Err(err) = result {
@@ -111,6 +113,28 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
 }
 
 async fn handle_connection<S>(
+    stream: S,
+    peer: std::net::SocketAddr,
+    cfg: ServerConfig,
+    nonce_cache: Arc<NonceCache>,
+    fast_tcp_state: FastTcpServerState,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if cfg.transport.tcp_modes.contains(&TcpTransportMode::FastTcp) {
+        let (stream, is_fast_tcp) = sniff_fast_tcp_magic(stream).await?;
+        if is_fast_tcp {
+            return handle_fast_tcp_connection(stream, peer, fast_tcp_state).await;
+        }
+
+        return handle_http_connection(stream, peer, cfg, nonce_cache).await;
+    }
+
+    handle_http_connection(stream, peer, cfg, nonce_cache).await
+}
+
+async fn handle_http_connection<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
     cfg: ServerConfig,
@@ -144,6 +168,81 @@ where
 
     write_error_response(&mut stream, 404, false).await?;
     Ok(())
+}
+
+async fn sniff_fast_tcp_magic<S>(mut stream: S) -> Result<(PrefixedStream<S>, bool)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut prefix = [0u8; FAST_TCP_MAGIC.len()];
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .context("failed to read connection prefix")?;
+    let is_fast_tcp = prefix == FAST_TCP_MAGIC;
+    Ok((PrefixedStream::new(stream, prefix.to_vec()), is_fast_tcp))
+}
+
+struct PrefixedStream<S> {
+    inner: S,
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(inner: S, prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefix,
+            prefix_pos: 0,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.prefix_pos < self.prefix.len() {
+            let available = &self.prefix[self.prefix_pos..];
+            let len = available.len().min(buf.remaining());
+            if len == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            buf.put_slice(&available[..len]);
+            self.prefix_pos += len;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 async fn serve_health_status<S>(stream: &mut S) -> Result<()>
@@ -233,11 +332,7 @@ where
         http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed()),
         "server HTTP upgrade accepted"
     );
-    if cfg.multiplex.enabled {
-        relay_multiplexed_tunnel_with_config(stream, peer, cfg.multiplex.clone()).await?;
-    } else {
-        relay_tunnel(stream, peer).await?;
-    }
+    relay_tunnel(stream, peer).await?;
     Ok(())
 }
 
@@ -536,52 +631,6 @@ impl NonceCache {
     }
 }
 
-fn build_tls_acceptor(tls: &ServerTlsConfig) -> Result<Option<TlsAcceptor>> {
-    if !tls.enabled {
-        return Ok(None);
-    }
-
-    let cert_path = tls
-        .cert_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("server tls.enabled=true requires tls.cert_path"))?;
-    let key_path = tls
-        .key_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("server tls.enabled=true requires tls.key_path"))?;
-
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("failed to build tls server config")?;
-
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
-}
-
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read certificates from {path}"))?;
-    if certs.is_empty() {
-        bail!("certificate file {path} does not contain certificates");
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open private key file {path}"))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("failed to read private key from {path}"))?
-        .ok_or_else(|| anyhow!("private key file {path} does not contain a supported key"))
-}
-
 async fn read_http_headers<S>(stream: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -650,7 +699,7 @@ fn optional_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::config::AuthorizedClient;
+    use shroud_core::config::{AuthorizedClient, ServerTlsConfig};
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -903,14 +952,15 @@ mod tests {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tunnel_path: "/api/tunnel".to_string(),
             web_root: web_root.path.to_string_lossy().into_owned(),
+            transport: Default::default(),
             tls: ServerTlsConfig::default(),
-            multiplex: Default::default(),
             clients: vec![AuthorizedClient {
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),
             }],
         };
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
+        let fast_tcp_state = FastTcpServerState::new(cfg.clients.clone());
 
         let handle = tokio::spawn(async move {
             handle_connection(
@@ -918,6 +968,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
                 nonce_cache,
+                fast_tcp_state,
             )
             .await
         });

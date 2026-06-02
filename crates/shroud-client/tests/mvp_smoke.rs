@@ -1,18 +1,14 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use shroud_client::routing::Router;
 use shroud_client::session::SessionCore;
 use shroud_client::socks5;
+use shroud_client::transport::fast_tcp::connect_fast_tcp;
 use shroud_client::tunnel::TunnelClient;
-use shroud_client::tunnel_manager::TunnelPool;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
-    RoutingConfig, RoutingRule, ServerConfig, ServerMultiplexConfig, ServerTlsConfig,
-};
-use shroud_core::protocol::{
-    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, PROTOCOL_VERSION,
+    RoutingConfig, RoutingRule, ServerConfig, ServerTlsConfig,
 };
 use shroud_server::web;
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -202,28 +198,6 @@ async fn socks_udp_associate_relays_datagrams_through_tunnel() -> TestResult {
 }
 
 #[tokio::test]
-async fn multiplexed_socks_udp_associate_is_rejected_as_tcp_only_mvp() -> TestResult {
-    let server = start_multiplexed_tunnel_server().await?;
-    let client = start_multiplexed_socks_client(
-        server.addr,
-        RoutingConfig {
-            default: RouteAction::Proxy,
-            rules: vec![],
-        },
-        "/api/tunnel",
-        CLIENT_SECRET,
-    )
-    .await?;
-
-    let reply = socks_udp_associate_reply_code(client.addr).await?;
-    assert_eq!(
-        reply, 0x07,
-        "expected SOCKS command-not-supported reply for multiplexed UDP ASSOCIATE"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn target_connect_failure_becomes_socks_general_failure() -> TestResult {
     let unused_target = free_addr().await?;
     let server = start_tunnel_server().await?;
@@ -246,18 +220,21 @@ async fn target_connect_failure_becomes_socks_general_failure() -> TestResult {
 #[tokio::test]
 async fn tunnel_rejects_bad_auth() -> TestResult {
     let server = start_tunnel_server().await?;
-    let tunnel = TunnelClient::new(
-        outbound_config(server.addr, "/api/tunnel"),
-        auth_config("wrong-secret"),
-    );
 
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 1).await {
-        Ok(_) => panic!("tunnel unexpectedly accepted invalid auth"),
+    let err = match connect_fast_tcp(
+        &outbound_config(server.addr, "/api/tunnel"),
+        &auth_config("wrong-secret"),
+        "127.0.0.1",
+        1,
+    )
+    .await
+    {
+        Ok(_) => panic!("fast_tcp unexpectedly accepted invalid auth"),
         Err(err) => err,
     };
 
     assert!(
-        err.to_string().contains("HTTP status 403"),
+        err.to_string().contains("auth_failed"),
         "unexpected bad-auth error: {err:#}"
     );
     Ok(())
@@ -307,238 +284,6 @@ async fn socks_connect_request_stall_does_not_complete() -> TestResult {
     assert!(
         result.is_err(),
         "SOCKS CONNECT request unexpectedly completed"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn tunnel_upgrade_stall_does_not_complete() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        let _ = read_http_headers(&mut stream).await;
-        sleep(Duration::from_secs(60)).await;
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let result = timeout(
-        Duration::from_millis(200),
-        tunnel.connect_target_via_tunnel("127.0.0.1", 80),
-    )
-    .await;
-    assert!(result.is_err(), "tunnel upgrade unexpectedly completed");
-    Ok(())
-}
-
-#[tokio::test]
-async fn tunnel_connect_reply_stall_does_not_complete() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            let _ = read_test_frame(&mut stream).await;
-            sleep(Duration::from_secs(60)).await;
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let result = timeout(
-        Duration::from_millis(200),
-        tunnel.connect_target_via_tunnel("127.0.0.1", 80),
-    )
-    .await;
-    assert!(
-        result.is_err(),
-        "TCP_CONNECT reply stall unexpectedly completed"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn relay_stall_does_not_complete() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            if let Ok(connect) = read_test_frame(&mut stream).await {
-                let _ = write_test_frame(
-                    &mut stream,
-                    Frame {
-                        frame_type: FrameType::TcpConnect,
-                        stream_id: connect.stream_id,
-                        flags: 0x0001,
-                        payload: Bytes::new(),
-                    },
-                )
-                .await;
-                sleep(Duration::from_secs(60)).await;
-            }
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-    let mut upstream = tunnel.connect_target_via_tunnel("127.0.0.1", 80).await?;
-    let (_app_side, mut socks_side) = tokio::io::duplex(64);
-
-    let result = timeout(
-        Duration::from_millis(200),
-        tunnel.relay_over_tunnel_stream(&mut socks_side, &mut upstream),
-    )
-    .await;
-    assert!(result.is_err(), "idle relay unexpectedly completed");
-    Ok(())
-}
-
-#[tokio::test]
-async fn oversized_connect_reply_frame_is_rejected_before_payload_allocation() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            let _ = read_test_frame(&mut stream).await;
-            let _ = write_oversized_frame_header(&mut stream).await;
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 80).await {
-        Ok(_) => panic!("oversized frame length must fail"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("frame payload too large"),
-        "unexpected oversized-frame error: {err:#}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn truncated_connect_reply_frame_fails_cleanly() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            let _ = read_test_frame(&mut stream).await;
-            let _ = stream
-                .write_all(&[PROTOCOL_VERSION, FrameType::TcpConnect as u8])
-                .await;
-            let _ = stream.shutdown().await;
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 80).await {
-        Ok(_) => panic!("truncated frame must fail"),
-        Err(err) => err,
-    };
-    assert!(
-        !err.to_string().is_empty(),
-        "truncated frame should return a usable error"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn unexpected_connect_reply_stream_id_fails_cleanly() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            let _ = read_test_frame(&mut stream).await;
-            let _ = write_test_frame(
-                &mut stream,
-                Frame {
-                    frame_type: FrameType::TcpConnect,
-                    stream_id: 99,
-                    flags: 0x0001,
-                    payload: Bytes::new(),
-                },
-            )
-            .await;
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 80).await {
-        Ok(_) => panic!("unexpected stream id must fail"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("unexpected stream id"),
-        "unexpected stream-id error: {err:#}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn error_frame_from_server_becomes_connect_failure() -> TestResult {
-    let fake = start_fake_tunnel_server(|mut stream| async move {
-        if read_http_headers(&mut stream).await.is_ok() {
-            let _ = write_upgrade_accepted(&mut stream).await;
-            if let Ok(connect) = read_test_frame(&mut stream).await {
-                let _ = write_test_frame(
-                    &mut stream,
-                    Frame {
-                        frame_type: FrameType::ErrorFrame,
-                        stream_id: connect.stream_id,
-                        flags: 0,
-                        payload: Bytes::from_static(b"target unavailable"),
-                    },
-                )
-                .await;
-            }
-        }
-    })
-    .await?;
-    let tunnel = TunnelClient::new(
-        outbound_config_plain(fake.addr, "/api/tunnel"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 80).await {
-        Ok(_) => panic!("ERROR frame must fail connect"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("server refused TCP_CONNECT")
-            && err.to_string().contains("target unavailable"),
-        "unexpected ERROR-frame connect failure: {err:#}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn tunnel_rejects_bad_path() -> TestResult {
-    let server = start_tunnel_server().await?;
-    let tunnel = TunnelClient::new(
-        outbound_config(server.addr, "/wrong-path"),
-        auth_config(CLIENT_SECRET),
-    );
-
-    let err = match tunnel.connect_target_via_tunnel("127.0.0.1", 1).await {
-        Ok(_) => panic!("tunnel unexpectedly accepted invalid path"),
-        Err(err) => err,
-    };
-
-    assert!(
-        err.to_string().contains("HTTP status 404"),
-        "unexpected bad-path error: {err:#}"
     );
     Ok(())
 }
@@ -627,39 +372,11 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
         listen: addr,
         tunnel_path: "/api/tunnel".to_string(),
         web_root: "./web".to_string(),
+        transport: Default::default(),
         tls: ServerTlsConfig {
             enabled: true,
             cert_path: Some(SERVER_CERT.to_string()),
             key_path: Some(SERVER_KEY.to_string()),
-        },
-        multiplex: Default::default(),
-        clients: vec![AuthorizedClient {
-            client_id: CLIENT_ID.to_string(),
-            client_secret: CLIENT_SECRET.to_string(),
-        }],
-    };
-
-    let handle = tokio::spawn(async move {
-        let _ = web::serve(cfg).await;
-    });
-    wait_for_tcp(addr).await?;
-    Ok(RunningTask { addr, handle })
-}
-
-async fn start_multiplexed_tunnel_server() -> TestResult<RunningTask> {
-    let addr = free_addr().await?;
-    let cfg = ServerConfig {
-        listen: addr,
-        tunnel_path: "/api/tunnel".to_string(),
-        web_root: "./web".to_string(),
-        tls: ServerTlsConfig {
-            enabled: true,
-            cert_path: Some(SERVER_CERT.to_string()),
-            key_path: Some(SERVER_KEY.to_string()),
-        },
-        multiplex: ServerMultiplexConfig {
-            enabled: true,
-            ..Default::default()
         },
         clients: vec![AuthorizedClient {
             client_id: CLIENT_ID.to_string(),
@@ -704,36 +421,6 @@ async fn start_socks_client_with_dns(
         auth_config(client_secret),
     );
     let session = SessionCore::new(router, tunnel, dns);
-
-    let handle = tokio::spawn(async move {
-        let _ = socks5::serve(listen, session).await;
-    });
-    wait_for_tcp(listen).await?;
-    Ok(RunningTask {
-        addr: listen,
-        handle,
-    })
-}
-
-async fn start_multiplexed_socks_client(
-    tunnel_addr: SocketAddr,
-    routing: RoutingConfig,
-    tunnel_path: &str,
-    client_secret: &str,
-) -> TestResult<RunningTask> {
-    let listen = free_addr().await?;
-    let router = Router::new(routing);
-    let mut outbound = outbound_config(tunnel_addr, tunnel_path);
-    outbound.multiplex = true;
-    outbound.multiplex_tunnels = 1;
-    outbound.min_tunnels = Some(1);
-    outbound.max_tunnels = Some(1);
-
-    let auth = auth_config(client_secret);
-    let tunnel = TunnelClient::new(outbound.clone(), auth.clone());
-    let tunnel_pool = TunnelPool::connect(outbound, auth).await?;
-    let session =
-        SessionCore::new_multiplexed(router, tunnel, tunnel_pool, ClientDnsConfig::default());
 
     let handle = tokio::spawn(async move {
         let _ = socks5::serve(listen, session).await;
@@ -830,22 +517,6 @@ async fn start_udp_echo_target() -> TestResult<RunningTask> {
     Ok(RunningTask { addr, handle })
 }
 
-async fn start_fake_tunnel_server<F, Fut>(handler: F) -> TestResult<RunningTask>
-where
-    F: FnOnce(TcpStream) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        if let Ok((stream, _peer)) = listener.accept().await {
-            handler(stream).await;
-        }
-    });
-
-    Ok(RunningTask { addr, handle })
-}
-
 fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
     OutboundConfig {
         server: "127.0.0.1".to_string(),
@@ -854,45 +525,6 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         tls: true,
         tls_server_name: Some("localhost".to_string()),
         tls_ca_cert_path: Some(CA_CERT.to_string()),
-        multiplex: false,
-        multiplex_tunnels: 4,
-        min_tunnels: None,
-        max_tunnels: None,
-        max_streams_per_tunnel: 16,
-        stream_slot_wait_timeout_ms: 2_000,
-        scale_up_writer_wait_ms: 100,
-        scale_up_queue_depth_ratio: 0.75,
-        scale_down_idle_secs: 60,
-        keepalive_interval_secs: 20,
-        keepalive_timeout_secs: 10,
-        max_buffer_per_stream_bytes: 1_048_576,
-        max_buffer_per_tunnel_bytes: 16_777_216,
-        max_pending_frames_per_stream: 64,
-    }
-}
-
-fn outbound_config_plain(server_addr: SocketAddr, path: &str) -> OutboundConfig {
-    OutboundConfig {
-        server: "127.0.0.1".to_string(),
-        port: server_addr.port(),
-        path: path.to_string(),
-        tls: false,
-        tls_server_name: None,
-        tls_ca_cert_path: None,
-        multiplex: false,
-        multiplex_tunnels: 4,
-        min_tunnels: None,
-        max_tunnels: None,
-        max_streams_per_tunnel: 16,
-        stream_slot_wait_timeout_ms: 2_000,
-        scale_up_writer_wait_ms: 100,
-        scale_up_queue_depth_ratio: 0.75,
-        scale_down_idle_secs: 60,
-        keepalive_interval_secs: 20,
-        keepalive_timeout_secs: 10,
-        max_buffer_per_stream_bytes: 1_048_576,
-        max_buffer_per_tunnel_bytes: 16_777_216,
-        max_pending_frames_per_stream: 64,
     }
 }
 
@@ -977,25 +609,6 @@ async fn socks_udp_associate(proxy_addr: SocketAddr) -> TestResult<(TcpStream, S
     Ok((stream, bind_addr))
 }
 
-async fn socks_udp_associate_reply_code(proxy_addr: SocketAddr) -> TestResult<u8> {
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
-
-    let mut handshake = [0u8; 2];
-    stream.read_exact(&mut handshake).await?;
-    assert_eq!(handshake, [0x05, 0x00], "SOCKS handshake failed");
-
-    stream
-        .write_all(&build_socks_udp_associate_request("0.0.0.0", 0)?)
-        .await?;
-
-    let mut reply = [0u8; 10];
-    stream.read_exact(&mut reply).await?;
-    assert_eq!(reply[0], 0x05, "unexpected SOCKS reply version");
-    assert_eq!(reply[2], 0x00, "unexpected SOCKS reply reserved byte");
-    Ok(reply[1])
-}
-
 fn build_socks_connect_request(host: &str, port: u16) -> TestResult<Vec<u8>> {
     let mut request = vec![0x05, 0x01, 0x00];
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
@@ -1036,54 +649,6 @@ async fn read_http_headers(stream: &mut TcpStream) -> TestResult<Vec<u8>> {
     }
 
     Err("HTTP headers exceeded test limit".into())
-}
-
-async fn write_upgrade_accepted(stream: &mut TcpStream) -> TestResult {
-    stream
-        .write_all(
-            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: shroud-tunnel\r\n\r\n",
-        )
-        .await?;
-    Ok(())
-}
-
-async fn read_test_frame(stream: &mut TcpStream) -> TestResult<Frame> {
-    let mut header = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header).await?;
-    let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    if payload_len > MAX_FRAME_PAYLOAD_LEN {
-        return Err(format!(
-            "frame payload too large: max={}, got={}",
-            MAX_FRAME_PAYLOAD_LEN, payload_len
-        )
-        .into());
-    }
-
-    let mut raw = Vec::with_capacity(HEADER_LEN + payload_len);
-    raw.extend_from_slice(&header);
-    if payload_len > 0 {
-        let mut payload = vec![0u8; payload_len];
-        stream.read_exact(&mut payload).await?;
-        raw.extend_from_slice(&payload);
-    }
-
-    Ok(Frame::decode(Bytes::from(raw))?)
-}
-
-async fn write_test_frame(stream: &mut TcpStream, frame: Frame) -> TestResult {
-    stream.write_all(frame.encode().as_ref()).await?;
-    Ok(())
-}
-
-async fn write_oversized_frame_header(stream: &mut TcpStream) -> TestResult {
-    let mut encoded = BytesMut::with_capacity(HEADER_LEN);
-    encoded.put_u8(PROTOCOL_VERSION);
-    encoded.put_u8(FrameType::TcpData as u8);
-    encoded.put_u64(1);
-    encoded.put_u16(0);
-    encoded.put_u32((MAX_FRAME_PAYLOAD_LEN + 1) as u32);
-    stream.write_all(encoded.freeze().as_ref()).await?;
-    Ok(())
 }
 
 async fn read_to_end(stream: &mut TcpStream) -> TestResult<String> {
