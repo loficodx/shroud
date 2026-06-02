@@ -1,40 +1,24 @@
+use crate::transport;
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use bytes::Bytes;
-use shroud_core::auth::compute_auth_tag;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 use shroud_core::protocol::{
     FrameType, UdpDatagram, decode_udp_associate_response_payload, decode_udp_datagram,
     encode_tcp_connect_payload, encode_udp_datagram, read_frame, write_frame,
 };
-use std::fs::File;
-use std::io::BufReader;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tracing::debug;
 
-const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const STREAM_ID: u64 = 1;
 const CONNECT_OK_FLAG: u16 = 0x0001;
-const TUNNEL_ENDPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_UPGRADE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const COPY_BUF_SIZE: usize = 32 * 1024;
 
-pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
-pub type TunnelStream = Box<dyn TunnelIo>;
+pub type TunnelStream = transport::BoxedIo;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RelayStats {
@@ -414,205 +398,23 @@ impl TunnelClient {
         target_host: &str,
         target_port: u16,
     ) -> Result<TunnelTransport> {
-        let server_connect_started = Instant::now();
-        let stream = timeout(
-            TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
-            TcpStream::connect((self.outbound.server.as_str(), self.outbound.port)),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "timed out connecting to tunnel endpoint {}:{}",
-                self.outbound.server, self.outbound.port
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "failed to connect to tunnel endpoint {}:{}",
-                self.outbound.server, self.outbound.port
-            )
-        })?;
-        let server_tcp_connect_ms = elapsed_millis(server_connect_started.elapsed());
-        debug!(
-            server = %self.outbound.server,
-            port = self.outbound.port,
+        let transport = transport::http::open_legacy_http_upgrade_transport(
+            &self.outbound,
+            &self.auth,
             target_host,
             target_port,
-            server_tcp_connect_ms,
-            "tunnel server TCP connect finished"
-        );
-
-        stream.set_nodelay(true).with_context(|| {
-            format!(
-                "failed to enable TCP_NODELAY for tunnel endpoint {}:{}",
-                self.outbound.server, self.outbound.port
-            )
-        })?;
-
-        let mut tls_handshake_ms = None;
-        let mut stream: TunnelStream = if self.outbound.tls {
-            let tls_started = Instant::now();
-            let connector = TlsConnector::from(Arc::new(build_tls_client_config(&self.outbound)?));
-            let server_name = self
-                .outbound
-                .tls_server_name
-                .as_deref()
-                .unwrap_or(&self.outbound.server)
-                .to_owned();
-            let server_name = ServerName::try_from(server_name)
-                .map_err(|err| anyhow!("invalid tls server name: {err}"))?;
-            let tls_stream = timeout(
-                TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
-                connector.connect(server_name, stream),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "timed out establishing tls connection to {}:{}",
-                    self.outbound.server, self.outbound.port
-                )
-            })?
-            .with_context(|| {
-                format!(
-                    "failed to establish tls connection to {}:{}",
-                    self.outbound.server, self.outbound.port
-                )
-            })?;
-            let elapsed_ms = elapsed_millis(tls_started.elapsed());
-            tls_handshake_ms = Some(elapsed_ms);
-            debug!(
-                server = %self.outbound.server,
-                port = self.outbound.port,
-                target_host,
-                target_port,
-                tls_handshake_ms = elapsed_ms,
-                "tunnel TLS handshake finished"
-            );
-            Box::new(tls_stream)
-        } else {
-            Box::new(stream)
-        };
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before unix epoch")?
-            .as_secs() as i64;
-
-        let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
-        let auth_tag = compute_auth_tag(
-            self.auth.client_secret.as_bytes(),
-            &nonce,
-            timestamp,
-            &self.auth.client_id,
         )
-        .context("failed to compute auth tag")?;
-
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: Upgrade\r\nUpgrade: shroud-tunnel\r\nX-Shroud-Client-Id: {client_id}\r\nX-Shroud-Timestamp: {timestamp}\r\nX-Shroud-Nonce: {nonce}\r\nX-Shroud-Auth: {auth}\r\n\r\n",
-            path = self.outbound.path,
-            host = self.outbound.server,
-            port = self.outbound.port,
-            client_id = self.auth.client_id,
-            timestamp = timestamp,
-            nonce = STANDARD_NO_PAD.encode(&nonce),
-            auth = auth_tag,
-        );
-        let http_upgrade_started = Instant::now();
-        stream.write_all(request.as_bytes()).await?;
-
-        let response = timeout(
-            HTTP_UPGRADE_RESPONSE_TIMEOUT,
-            read_http_headers(&mut stream),
-        )
-        .await
-        .context("timed out waiting for HTTP upgrade response")??;
-        let status = parse_status_code(&response).context("failed to parse tunnel response")?;
-        let http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed());
-
-        if status != 101 {
-            bail!("tunnel endpoint rejected upgrade with HTTP status {status}");
-        }
-
-        debug!(
-            server = %self.outbound.server,
-            tunnel_path = %self.outbound.path,
-            client_id = %self.auth.client_id,
-            target_host,
-            target_port,
-            http_upgrade_ms,
-            "tunnel upgrade accepted"
-        );
+        .await?;
 
         Ok(TunnelTransport {
-            stream,
-            server_tcp_connect_ms,
-            tls_handshake_ms,
-            http_upgrade_ms,
+            stream: transport.stream,
+            server_tcp_connect_ms: transport.server_tcp_connect_ms,
+            tls_handshake_ms: transport.tls_handshake_ms,
+            http_upgrade_ms: transport.http_upgrade_ms,
         })
     }
 }
 
 fn elapsed_millis(elapsed: Duration) -> u64 {
     elapsed.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    if let Some(path) = &outbound.tls_ca_cert_path {
-        let certs = load_certs(path)?;
-        let (_added, ignored) = root_store.add_parsable_certificates(certs);
-        if ignored > 0 {
-            bail!("ignored {ignored} invalid certificate(s) from tls_ca_cert_path={path}");
-        }
-    }
-
-    Ok(ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
-}
-
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read certificates from {path}"))
-}
-
-async fn read_http_headers<R>(stream: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut data = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-
-    while data.len() < MAX_HTTP_HEADERS {
-        stream.read_exact(&mut byte).await?;
-        data.push(byte[0]);
-        if data.ends_with(b"\r\n\r\n") {
-            return Ok(data);
-        }
-    }
-
-    bail!("http headers are too large");
-}
-
-fn parse_status_code(raw_headers: &[u8]) -> Result<u16> {
-    let headers = std::str::from_utf8(raw_headers).context("http headers are not valid utf-8")?;
-    let status_line = headers
-        .split("\r\n")
-        .next()
-        .ok_or_else(|| anyhow!("empty HTTP response"))?;
-    let mut parts = status_line.split_whitespace();
-    let _version = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP version in response"))?;
-    let code = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP status code in response"))?;
-    code.parse::<u16>()
-        .context("HTTP status code is not a valid integer")
 }

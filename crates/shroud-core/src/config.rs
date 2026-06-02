@@ -11,10 +11,15 @@ use uuid::Uuid;
 pub struct ClientConfig {
     pub inbound: Option<SocksInboundConfig>,
     pub inbounds: ClientInboundsConfig,
+    pub transport: TransportConfig,
     pub outbound: OutboundConfig,
     pub auth: ClientAuthConfig,
     pub routing: RoutingConfig,
     pub dns: ClientDnsConfig,
+    #[serde(skip_serializing)]
+    transport_source: TransportConfigSource,
+    #[serde(skip_serializing)]
+    transport_compat_warnings: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for ClientConfig {
@@ -31,10 +36,40 @@ impl<'de> Deserialize<'de> for ClientConfig {
 
         let inbound = inbounds.socks.clone();
 
-        let outbound = raw
+        let legacy_outbound = raw
             .outbound
-            .or_else(|| raw.outbounds.and_then(|outbounds| outbounds.proxy))
-            .unwrap_or_default();
+            .or_else(|| raw.outbounds.and_then(|outbounds| outbounds.proxy));
+
+        let (transport, outbound, transport_source, transport_compat_warnings) =
+            match (raw.transport, legacy_outbound) {
+                (Some(transport), Some(_)) => (
+                    transport.clone(),
+                    OutboundConfig::from_transport(&transport),
+                    TransportConfigSource::Transport,
+                    vec![
+                        "outbound config is deprecated and ignored when transport is set"
+                            .to_string(),
+                    ],
+                ),
+                (Some(transport), None) => (
+                    transport.clone(),
+                    OutboundConfig::from_transport(&transport),
+                    TransportConfigSource::Transport,
+                    Vec::new(),
+                ),
+                (None, Some(outbound)) => (
+                    TransportConfig::from_legacy_outbound(&outbound),
+                    outbound.clone(),
+                    TransportConfigSource::LegacyOutbound,
+                    legacy_outbound_warnings(&outbound),
+                ),
+                (None, None) => (
+                    TransportConfig::default(),
+                    OutboundConfig::default(),
+                    TransportConfigSource::Default,
+                    Vec::new(),
+                ),
+            };
 
         let auth = raw.auth.unwrap_or_default();
 
@@ -44,11 +79,20 @@ impl<'de> Deserialize<'de> for ClientConfig {
         Ok(Self {
             inbound,
             inbounds,
+            transport,
             outbound,
             auth,
             routing,
             dns,
+            transport_source,
+            transport_compat_warnings,
         })
+    }
+}
+
+impl ClientConfig {
+    pub fn transport_compat_warnings(&self) -> &[String] {
+        &self.transport_compat_warnings
     }
 }
 
@@ -178,6 +222,34 @@ impl Default for OutboundConfig {
 }
 
 impl OutboundConfig {
+    fn from_transport(transport: &TransportConfig) -> Self {
+        Self {
+            server: transport.server.clone(),
+            port: transport.port,
+            path: transport
+                .path
+                .clone()
+                .unwrap_or_else(default_legacy_tunnel_path),
+            tls: transport.tls,
+            tls_server_name: transport.tls_server_name.clone(),
+            tls_ca_cert_path: transport.tls_ca_cert_path.clone(),
+            multiplex: false,
+            multiplex_tunnels: default_multiplex_tunnels(),
+            min_tunnels: None,
+            max_tunnels: None,
+            max_streams_per_tunnel: default_max_streams_per_tunnel(),
+            stream_slot_wait_timeout_ms: default_stream_slot_wait_timeout_ms(),
+            scale_up_writer_wait_ms: default_scale_up_writer_wait_ms(),
+            scale_up_queue_depth_ratio: default_scale_up_queue_depth_ratio(),
+            scale_down_idle_secs: default_scale_down_idle_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+            keepalive_timeout_secs: default_keepalive_timeout_secs(),
+            max_buffer_per_stream_bytes: default_max_buffer_per_stream_bytes(),
+            max_buffer_per_tunnel_bytes: default_max_buffer_per_tunnel_bytes(),
+            max_pending_frames_per_stream: default_max_pending_frames_per_stream(),
+        }
+    }
+
     pub fn effective_min_tunnels(&self) -> usize {
         self.min_tunnels.unwrap_or(self.multiplex_tunnels).max(1)
     }
@@ -189,8 +261,73 @@ impl OutboundConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpTransportMode {
+    FastTcp,
+    BalancedTcp,
+}
+
+impl Default for TcpTransportMode {
+    fn default() -> Self {
+        default_tcp_mode()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportConfig {
+    #[serde(default = "default_tcp_mode")]
+    pub tcp_mode: TcpTransportMode,
+    pub server: String,
+    pub port: u16,
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            tcp_mode: default_tcp_mode(),
+            server: String::new(),
+            port: 0,
+            tls: true,
+            tls_server_name: None,
+            tls_ca_cert_path: None,
+            path: None,
+        }
+    }
+}
+
+impl TransportConfig {
+    fn from_legacy_outbound(outbound: &OutboundConfig) -> Self {
+        Self {
+            tcp_mode: default_tcp_mode(),
+            server: outbound.server.clone(),
+            port: outbound.port,
+            tls: outbound.tls,
+            tls_server_name: outbound.tls_server_name.clone(),
+            tls_ca_cert_path: outbound.tls_ca_cert_path.clone(),
+            path: (!outbound.path.is_empty()).then(|| outbound.path.clone()),
+        }
+    }
+}
+
 fn default_multiplex_tunnels() -> usize {
     4
+}
+
+fn default_tcp_mode() -> TcpTransportMode {
+    TcpTransportMode::FastTcp
+}
+
+fn default_legacy_tunnel_path() -> String {
+    "/api/tunnel".to_string()
 }
 
 fn default_max_streams_per_tunnel() -> usize {
@@ -231,6 +368,33 @@ fn default_max_buffer_per_tunnel_bytes() -> usize {
 
 fn default_max_pending_frames_per_stream() -> usize {
     64
+}
+
+fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
+    let mut warnings = vec![
+        "outbound config is deprecated; use transport.tcp_mode, transport.server, and transport.port"
+            .to_string(),
+    ];
+    warnings.push("outbound.multiplex is deprecated and will be removed".to_string());
+    if outbound.multiplex {
+        warnings.push(
+            "outbound.multiplex=true keeps using the legacy framed multiplex path for now"
+                .to_string(),
+        );
+    }
+    if !outbound.path.is_empty() {
+        warnings.push(
+            "outbound.path with custom HTTP Upgrade is deprecated and will be removed".to_string(),
+        );
+    }
+    warnings
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportConfigSource {
+    Transport,
+    LegacyOutbound,
+    Default,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -320,16 +484,43 @@ impl Default for RouteAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
-    #[serde(default)]
+    #[serde(default = "default_legacy_tunnel_path")]
     pub tunnel_path: String,
     #[serde(default)]
     pub web_root: String,
+    #[serde(default)]
+    pub transport: ServerTransportConfig,
     #[serde(default)]
     pub tls: ServerTlsConfig,
     #[serde(default)]
     pub multiplex: ServerMultiplexConfig,
     #[serde(default)]
     pub clients: Vec<AuthorizedClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerTransportConfig {
+    #[serde(default = "default_server_tcp_modes")]
+    pub tcp_modes: Vec<TcpTransportMode>,
+    #[serde(default = "default_balanced_path")]
+    pub balanced_path: String,
+}
+
+impl Default for ServerTransportConfig {
+    fn default() -> Self {
+        Self {
+            tcp_modes: default_server_tcp_modes(),
+            balanced_path: default_balanced_path(),
+        }
+    }
+}
+
+fn default_server_tcp_modes() -> Vec<TcpTransportMode> {
+    vec![TcpTransportMode::FastTcp]
+}
+
+fn default_balanced_path() -> String {
+    "/api/v1/events".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -493,7 +684,14 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
         }
     }
 
-    validate_outbound_config(&mut errors, &config.outbound);
+    match config.transport_source {
+        TransportConfigSource::Transport => {
+            validate_transport_config(&mut errors, "transport", &config.transport);
+        }
+        TransportConfigSource::LegacyOutbound | TransportConfigSource::Default => {
+            validate_outbound_config(&mut errors, &config.outbound);
+        }
+    }
     validate_client_auth_config(&mut errors, "auth", &config.auth);
     validate_routing_config_into(&mut errors, "routing.rules", &config.routing);
 
@@ -550,6 +748,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     for (index, client) in config.clients.iter().enumerate() {
         validate_authorized_client_config(&mut errors, &format!("clients[{index}]"), client);
     }
+    validate_server_transport_config(&mut errors, "transport", &config.transport);
     validate_flow_control_config(
         &mut errors,
         "multiplex",
@@ -565,6 +764,70 @@ pub fn validate_routing_config(config: &RoutingConfig) -> Result<(), ConfigValid
     let mut errors = Vec::new();
     validate_routing_config_into(&mut errors, "routing.rules", config);
     finish_validation(errors)
+}
+
+fn validate_transport_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    transport: &TransportConfig,
+) {
+    validate_non_empty(errors, &format!("{base_path}.server"), &transport.server);
+    if transport.port == 0 {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.port"),
+            "port must be greater than 0",
+        ));
+    }
+    if transport.tcp_mode == TcpTransportMode::BalancedTcp && transport.path.is_none() {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.path"),
+            "is required when tcp_mode=balanced_tcp",
+        ));
+    }
+    if let Some(path) = &transport.path {
+        validate_http_path(errors, &format!("{base_path}.path"), path);
+    }
+    if transport.tls {
+        if let Some(server_name) = &transport.tls_server_name {
+            validate_non_empty(errors, &format!("{base_path}.tls_server_name"), server_name);
+            if server_name.contains('/') || server_name.contains(':') {
+                errors.push(ConfigFieldError::new(
+                    format!("{base_path}.tls_server_name"),
+                    "must be a DNS name or IP address, not a URL",
+                ));
+            }
+        }
+        if let Some(path) = &transport.tls_ca_cert_path {
+            if path.trim().is_empty() {
+                errors.push(ConfigFieldError::new(
+                    format!("{base_path}.tls_ca_cert_path"),
+                    "must not be empty",
+                ));
+            } else {
+                validate_file_path(errors, &format!("{base_path}.tls_ca_cert_path"), path);
+            }
+        }
+    }
+}
+
+fn validate_server_transport_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    transport: &ServerTransportConfig,
+) {
+    if transport.tcp_modes.is_empty() {
+        errors.push(ConfigFieldError::new(
+            format!("{base_path}.tcp_modes"),
+            "must include at least one TCP transport mode",
+        ));
+    }
+    if transport.tcp_modes.contains(&TcpTransportMode::BalancedTcp) {
+        validate_http_path(
+            errors,
+            &format!("{base_path}.balanced_path"),
+            &transport.balanced_path,
+        );
+    }
 }
 
 fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &OutboundConfig) {
@@ -828,6 +1091,8 @@ struct ClientConfigRaw {
     #[serde(default)]
     inbounds: Option<ClientInboundsRaw>,
     #[serde(default)]
+    transport: Option<TransportConfig>,
+    #[serde(default)]
     outbound: Option<OutboundConfig>,
     #[serde(default)]
     outbounds: Option<ClientOutboundsRaw>,
@@ -887,6 +1152,112 @@ auth:
   client_id: "11111111-1111-1111-1111-111111111111"
   client_secret: "secret"
 "#;
+
+    const BASE_CLIENT_TRANSPORT_CONFIG: &str = r#"
+inbound:
+  listen: "127.0.0.1:1080"
+transport:
+  tcp_mode: fast_tcp
+  server: "127.0.0.1"
+  port: 8443
+  tls: true
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "secret"
+"#;
+
+    #[test]
+    fn client_config_accepts_fast_tcp_transport_shape() {
+        let cfg = load_client_config_yaml(BASE_CLIENT_TRANSPORT_CONFIG).expect("valid config");
+
+        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::FastTcp);
+        assert_eq!(cfg.transport.server, "127.0.0.1");
+        assert_eq!(cfg.transport.port, 8443);
+        assert!(cfg.transport.tls);
+        assert!(cfg.transport.path.is_none());
+        assert!(cfg.transport_compat_warnings().is_empty());
+
+        assert_eq!(cfg.outbound.server, "127.0.0.1");
+        assert_eq!(cfg.outbound.port, 8443);
+        assert_eq!(cfg.outbound.path, "/api/tunnel");
+        assert!(!cfg.outbound.multiplex);
+    }
+
+    #[test]
+    fn client_config_accepts_balanced_tcp_transport_shape() {
+        let raw = BASE_CLIENT_TRANSPORT_CONFIG.replace(
+            "tcp_mode: fast_tcp\n  server",
+            "tcp_mode: balanced_tcp\n  path: \"/api/v1/events\"\n  server",
+        );
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::BalancedTcp);
+        assert_eq!(cfg.transport.path.as_deref(), Some("/api/v1/events"));
+        assert_eq!(cfg.outbound.path, "/api/v1/events");
+    }
+
+    #[test]
+    fn client_config_maps_legacy_outbound_to_transport_with_warnings() {
+        let cfg = load_client_config_yaml(BASE_CLIENT_CONFIG).expect("valid config");
+
+        assert_eq!(cfg.transport.tcp_mode, TcpTransportMode::FastTcp);
+        assert_eq!(cfg.transport.server, "127.0.0.1");
+        assert_eq!(cfg.transport.port, 8443);
+        assert_eq!(cfg.transport.path.as_deref(), Some("/api/tunnel"));
+
+        let warnings = cfg.transport_compat_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outbound config is deprecated"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outbound.multiplex"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outbound.path"))
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_balanced_tcp_without_path() {
+        let raw =
+            BASE_CLIENT_TRANSPORT_CONFIG.replace("tcp_mode: fast_tcp", "tcp_mode: balanced_tcp");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.path"));
+    }
+
+    #[test]
+    fn server_config_accepts_transport_modes() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+transport:
+  tcp_modes:
+    - fast_tcp
+    - balanced_tcp
+  balanced_path: "/api/v1/events"
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert_eq!(
+            cfg.transport.tcp_modes,
+            vec![TcpTransportMode::FastTcp, TcpTransportMode::BalancedTcp]
+        );
+        assert_eq!(cfg.transport.balanced_path, "/api/v1/events");
+    }
 
     #[test]
     fn client_dns_config_defaults_to_remote_dns_warning_without_blocking() {

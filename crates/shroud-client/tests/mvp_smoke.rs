@@ -627,6 +627,7 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
         listen: addr,
         tunnel_path: "/api/tunnel".to_string(),
         web_root: "./web".to_string(),
+        transport: Default::default(),
         tls: ServerTlsConfig {
             enabled: true,
             cert_path: Some(SERVER_CERT.to_string()),
@@ -652,6 +653,7 @@ async fn start_multiplexed_tunnel_server() -> TestResult<RunningTask> {
         listen: addr,
         tunnel_path: "/api/tunnel".to_string(),
         web_root: "./web".to_string(),
+        transport: Default::default(),
         tls: ServerTlsConfig {
             enabled: true,
             cert_path: Some(SERVER_CERT.to_string()),

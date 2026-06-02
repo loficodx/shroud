@@ -1,13 +1,12 @@
 use crate::auth::validate_auth;
 use crate::relay::{relay_multiplexed_tunnel_with_config, relay_tunnel};
+use crate::transport::tls::build_tls_acceptor;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use shroud_core::config::{ServerConfig, ServerTlsConfig};
+use shroud_core::config::ServerConfig;
 use std::collections::HashMap;
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,9 +16,6 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, info};
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
@@ -536,52 +532,6 @@ impl NonceCache {
     }
 }
 
-fn build_tls_acceptor(tls: &ServerTlsConfig) -> Result<Option<TlsAcceptor>> {
-    if !tls.enabled {
-        return Ok(None);
-    }
-
-    let cert_path = tls
-        .cert_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("server tls.enabled=true requires tls.cert_path"))?;
-    let key_path = tls
-        .key_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("server tls.enabled=true requires tls.key_path"))?;
-
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("failed to build tls server config")?;
-
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
-}
-
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read certificates from {path}"))?;
-    if certs.is_empty() {
-        bail!("certificate file {path} does not contain certificates");
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        File::open(path).with_context(|| format!("failed to open private key file {path}"))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("failed to read private key from {path}"))?
-        .ok_or_else(|| anyhow!("private key file {path} does not contain a supported key"))
-}
-
 async fn read_http_headers<S>(stream: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -650,7 +600,7 @@ fn optional_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::config::AuthorizedClient;
+    use shroud_core::config::{AuthorizedClient, ServerTlsConfig};
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -903,6 +853,7 @@ mod tests {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tunnel_path: "/api/tunnel".to_string(),
             web_root: web_root.path.to_string_lossy().into_owned(),
+            transport: Default::default(),
             tls: ServerTlsConfig::default(),
             multiplex: Default::default(),
             clients: vec![AuthorizedClient {

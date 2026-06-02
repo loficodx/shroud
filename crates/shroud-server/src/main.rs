@@ -22,7 +22,12 @@ async fn main() -> Result<()> {
     let cfg = load_server_config_yaml(&raw)
         .with_context(|| format!("failed to load server config: {config_path}"))?;
 
-    info!(listen = %cfg.listen, "starting shroud server");
+    info!(
+        listen = %cfg.listen,
+        tcp_modes = ?cfg.transport.tcp_modes,
+        balanced_path = %cfg.transport.balanced_path,
+        "starting shroud server"
+    );
     web::serve(cfg).await
 }
 
