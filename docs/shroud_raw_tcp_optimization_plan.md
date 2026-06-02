@@ -771,7 +771,7 @@ relay:
 
 ---
 
-## 15. Метрики raw_tcp
+## 15. ~~Метрики raw_tcp~~
 
 ### Минимальные метрики
 
@@ -797,13 +797,13 @@ raw_tcp_handshake_duration
 
 ```text
 target
-server_addr
-connect_duration
-tls_duration
-handshake_duration
+server_tcp_connect_ms
+tls_handshake_ms
+raw_tcp_handshake_ms
 relay_bytes_up
 relay_bytes_down
-relay_duration
+relay_duration_ms
+close_reason
 error_kind
 ```
 
@@ -813,12 +813,16 @@ error_kind
 client_addr
 target
 auth_result
-target_connect_duration
+target_tcp_connect_ms
 relay_bytes_up
 relay_bytes_down
-relay_duration
+relay_duration_ms
 close_reason
 ```
+
+Текущая реализация оставляет один итоговый `debug` log event на закрытие client relay
+и один итоговый `debug` log event на закрытие server relay. Отдельный успешный
+`raw_tcp connect accepted` event не нужен: он дублирует timing-поля и засоряет лог.
 
 ### Главное
 
@@ -1053,8 +1057,8 @@ relay errors
 - [x] Добавить server max concurrent connections.
 - [x] Добавить client max concurrent connections.
 - [ ] Добавить target ACL/deny private IPs.
-- [ ] Добавить понятные close reasons в logs.
-- [ ] Добавить базовые metrics.
+- [x] Добавить понятные close reasons в logs.
+- [x] Добавить базовые metrics.
 
 ### Этап 6 — tests
 

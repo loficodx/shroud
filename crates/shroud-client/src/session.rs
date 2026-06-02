@@ -115,7 +115,7 @@ impl SessionCore {
                 Ok(TcpOpenResult::Opened(TcpOutbound {
                     action,
                     metrics: TcpOpenMetrics {
-                        target_tcp_connect_ms,
+                        target_tcp_connect_ms: Some(target_tcp_connect_ms),
                         ..TcpOpenMetrics::default()
                     },
                     stream: TcpOutboundStream::Direct(stream),
@@ -198,8 +198,8 @@ pub struct TcpOutbound {
 pub struct TcpOpenMetrics {
     pub server_tcp_connect_ms: Option<u64>,
     pub tls_handshake_ms: Option<u64>,
-    pub http_upgrade_ms: Option<u64>,
-    pub target_tcp_connect_ms: u64,
+    pub raw_tcp_handshake_ms: Option<u64>,
+    pub target_tcp_connect_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,8 +228,8 @@ impl From<TcpTransportMetrics> for TcpOpenMetrics {
         Self {
             server_tcp_connect_ms: metrics.server_tcp_connect_ms,
             tls_handshake_ms: metrics.tls_handshake_ms,
-            http_upgrade_ms: metrics.http_upgrade_ms,
-            target_tcp_connect_ms: metrics.target_tcp_connect_ms,
+            raw_tcp_handshake_ms: metrics.raw_tcp_handshake_ms,
+            target_tcp_connect_ms: None,
         }
     }
 }

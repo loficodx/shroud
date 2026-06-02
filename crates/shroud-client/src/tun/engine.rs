@@ -4,6 +4,7 @@ use crate::tun::dns::FakeDns;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, TcpListener, TcpStream};
+use shroud_core::config::RouteAction;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -210,26 +211,36 @@ async fn handle_tcp_stream(
             let relay_started = Instant::now();
             let stats = session.relay_tcp(&mut stream, outbound).await?;
             let relay_elapsed = relay_started.elapsed();
-            let total_bytes = stats.total_bytes();
-            let mbps = stats.mbps(relay_elapsed);
 
-            debug!(
-                %source,
-                %destination,
-                target_host,
-                target_port,
-                route = ?action,
-                server_tcp_connect_ms = metrics.server_tcp_connect_ms,
-                tls_handshake_ms = metrics.tls_handshake_ms,
-                http_upgrade_ms = metrics.http_upgrade_ms,
-                target_tcp_connect_ms = metrics.target_tcp_connect_ms,
-                client_to_upstream_bytes = stats.client_to_upstream_bytes,
-                upstream_to_client_bytes = stats.upstream_to_client_bytes,
-                total_bytes,
-                duration_ms = elapsed_millis(relay_elapsed),
-                mbps,
-                "TUN TCP relay finished"
-            );
+            match action {
+                RouteAction::Proxy => debug!(
+                    %source,
+                    %destination,
+                    target_host,
+                    target_port,
+                    server_tcp_connect_ms = metrics.server_tcp_connect_ms,
+                    tls_handshake_ms = metrics.tls_handshake_ms,
+                    raw_tcp_handshake_ms = metrics.raw_tcp_handshake_ms,
+                    relay_bytes_up = stats.client_to_upstream_bytes,
+                    relay_bytes_down = stats.upstream_to_client_bytes,
+                    relay_duration_ms = elapsed_millis(relay_elapsed),
+                    close_reason = "closed",
+                    "TUN raw_tcp relay closed"
+                ),
+                RouteAction::Direct => debug!(
+                    %source,
+                    %destination,
+                    target_host,
+                    target_port,
+                    target_tcp_connect_ms = metrics.target_tcp_connect_ms,
+                    relay_bytes_up = stats.client_to_upstream_bytes,
+                    relay_bytes_down = stats.upstream_to_client_bytes,
+                    relay_duration_ms = elapsed_millis(relay_elapsed),
+                    close_reason = "closed",
+                    "TUN direct TCP relay closed"
+                ),
+                RouteAction::Block => {}
+            }
         }
         TcpOpenResult::Blocked => {
             bail!("route blocked TUN TCP target {target_host}:{target_port}");

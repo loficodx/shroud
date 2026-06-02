@@ -1,5 +1,6 @@
 use crate::session::{DnsPolicyResult, SessionContext, SessionCore, TcpOpenResult};
 use anyhow::{Context, Result, bail};
+use shroud_core::config::RouteAction;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,25 +151,34 @@ async fn handle_connection(
         .await
         .with_context(|| format!("relay failed for {target_host}:{target_port}"))?;
     let relay_elapsed = relay_started.elapsed();
-    let total_bytes = stats.total_bytes();
-    let mbps = stats.mbps(relay_elapsed);
 
-    debug!(
-        %peer,
-        target_host,
-        target_port,
-        route = ?action,
-        server_tcp_connect_ms = metrics.server_tcp_connect_ms,
-        tls_handshake_ms = metrics.tls_handshake_ms,
-        http_upgrade_ms = metrics.http_upgrade_ms,
-        target_tcp_connect_ms = metrics.target_tcp_connect_ms,
-        client_to_upstream_bytes = stats.client_to_upstream_bytes,
-        upstream_to_client_bytes = stats.upstream_to_client_bytes,
-        total_bytes,
-        duration_ms = elapsed_millis(relay_elapsed),
-        mbps,
-        "connection relay finished"
-    );
+    match action {
+        RouteAction::Proxy => debug!(
+            %peer,
+            target_host,
+            target_port,
+            server_tcp_connect_ms = metrics.server_tcp_connect_ms,
+            tls_handshake_ms = metrics.tls_handshake_ms,
+            raw_tcp_handshake_ms = metrics.raw_tcp_handshake_ms,
+            relay_bytes_up = stats.client_to_upstream_bytes,
+            relay_bytes_down = stats.upstream_to_client_bytes,
+            relay_duration_ms = elapsed_millis(relay_elapsed),
+            close_reason = "closed",
+            "raw_tcp client relay closed"
+        ),
+        RouteAction::Direct => debug!(
+            %peer,
+            target_host,
+            target_port,
+            target_tcp_connect_ms = metrics.target_tcp_connect_ms,
+            relay_bytes_up = stats.client_to_upstream_bytes,
+            relay_bytes_down = stats.upstream_to_client_bytes,
+            relay_duration_ms = elapsed_millis(relay_elapsed),
+            close_reason = "closed",
+            "direct TCP relay closed"
+        ),
+        RouteAction::Block => {}
+    }
 
     Ok(())
 }

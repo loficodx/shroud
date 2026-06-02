@@ -96,10 +96,11 @@ where
             .context("failed to write raw_tcp auth failure status")?;
         debug!(
             %peer,
-            client_id = %req.auth.client_id,
             target_host = %req.host,
             target_port = req.port,
-            "raw_tcp auth rejected"
+            auth_result = "failed",
+            close_reason = "auth_failed",
+            "raw_tcp request rejected"
         );
         return Ok(());
     }
@@ -117,10 +118,11 @@ where
                 .context("failed to write raw_tcp target timeout status")?;
             debug!(
                 %peer,
-                client_id = %req.auth.client_id,
                 target_host = %req.host,
                 target_port = req.port,
+                auth_result = "ok",
                 target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                close_reason = "target_connect_timeout",
                 "raw_tcp target connect timed out"
             );
             return Ok(());
@@ -131,10 +133,11 @@ where
                 .context("failed to write raw_tcp target ACL status")?;
             debug!(
                 %peer,
-                client_id = %req.auth.client_id,
                 target_host = %req.host,
                 target_port = req.port,
+                auth_result = "ok",
                 target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                close_reason = "target_forbidden",
                 reason,
                 "raw_tcp target blocked by ACL"
             );
@@ -146,10 +149,11 @@ where
                 .context("failed to write raw_tcp target failure status")?;
             debug!(
                 %peer,
-                client_id = %req.auth.client_id,
                 target_host = %req.host,
                 target_port = req.port,
+                auth_result = "ok",
                 target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                close_reason = "target_connect_failed",
                 error = %err,
                 "raw_tcp target connect failed"
             );
@@ -182,14 +186,15 @@ where
 
     debug!(
         %peer,
-        client_id = %req.auth.client_id,
         target_host = %req.host,
         target_port = req.port,
+        auth_result = "ok",
         target_tcp_connect_ms,
-        relay_ms = elapsed_millis(relay_started.elapsed()),
-        bytes_up,
-        bytes_down,
-        "raw_tcp raw relay closed"
+        relay_duration_ms = elapsed_millis(relay_started.elapsed()),
+        relay_bytes_up = bytes_up,
+        relay_bytes_down = bytes_down,
+        close_reason = "closed",
+        "raw_tcp server relay closed"
     );
 
     Ok(())

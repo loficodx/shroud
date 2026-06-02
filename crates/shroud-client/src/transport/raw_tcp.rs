@@ -14,7 +14,6 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tracing::debug;
 
 #[derive(Clone)]
 pub struct RawTcpTransport {
@@ -186,7 +185,7 @@ async fn connect_raw_tcp_with_cached_tls(
     };
 
     let req = TcpConnectRequest::new(target_host, target_port, build_auth_proof(auth)?);
-    let target_connect_started = Instant::now();
+    let raw_tcp_handshake_started = Instant::now();
     timeout(
         timeouts.raw_tcp_handshake,
         write_raw_tcp_connect_request(&mut stream, &req),
@@ -202,29 +201,17 @@ async fn connect_raw_tcp_with_cached_tls(
     .await
     .context("timed out waiting for raw_tcp connect status")?
     .context("failed to read raw_tcp connect status")?;
-    let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+    let raw_tcp_handshake_ms = elapsed_millis(raw_tcp_handshake_started.elapsed());
     if status != TcpConnectStatus::Ok {
         bail!("raw_tcp connect rejected: {status}");
     }
-
-    debug!(
-        server = %outbound.server,
-        port = outbound.port,
-        target_host,
-        target_port,
-        server_tcp_connect_ms,
-        tls_handshake_ms,
-        target_tcp_connect_ms,
-        "raw_tcp connect accepted"
-    );
 
     Ok(TcpTransportConnect {
         stream,
         metrics: TcpTransportMetrics {
             server_tcp_connect_ms: Some(server_tcp_connect_ms),
             tls_handshake_ms,
-            http_upgrade_ms: None,
-            target_tcp_connect_ms,
+            raw_tcp_handshake_ms: Some(raw_tcp_handshake_ms),
         },
     })
 }
@@ -345,7 +332,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(connected.metrics.server_tcp_connect_ms.is_some());
-        assert!(connected.metrics.http_upgrade_ms.is_none());
+        assert!(connected.metrics.raw_tcp_handshake_ms.is_some());
         connected.stream.write_all(b"ping").await.unwrap();
 
         let mut buf = [0u8; 4];

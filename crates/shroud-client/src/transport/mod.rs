@@ -18,8 +18,7 @@ pub type BoxedIo = Box<dyn AsyncReadWrite + Send + Unpin>;
 pub struct TcpTransportMetrics {
     pub server_tcp_connect_ms: Option<u64>,
     pub tls_handshake_ms: Option<u64>,
-    pub http_upgrade_ms: Option<u64>,
-    pub target_tcp_connect_ms: u64,
+    pub raw_tcp_handshake_ms: Option<u64>,
 }
 
 pub struct TcpTransportConnect {
