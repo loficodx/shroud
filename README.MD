@@ -192,6 +192,13 @@ outbound:
   keepalive_interval_secs: 20
   keepalive_timeout_secs: 10
 
+timeouts:
+  server_connect_ms: 10000
+  tls_handshake_ms: 10000
+  raw_tcp_handshake_ms: 5000
+  target_connect_ms: 10000
+  idle_timeout_sec: 300
+
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
   client_secret: "replace-with-random-secret"
@@ -224,6 +231,17 @@ tls:
   enabled: true
   cert_path: "certs/localhost.crt"
   key_path: "certs/localhost.key"
+timeouts:
+  server_connect_ms: 10000
+  tls_handshake_ms: 10000
+  raw_tcp_handshake_ms: 5000
+  target_connect_ms: 10000
+  idle_timeout_sec: 300
+security:
+  deny_private_ips: true
+  allow_ports:
+    - 80
+    - 443
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "replace-with-random-secret"
@@ -654,4 +672,3 @@ For verbose logs:
 RUST_LOG=debug cargo run -p shroud-client -- configs/client.yaml
 RUST_LOG=debug cargo run -p shroud-server -- configs/server.yaml
 ```
-

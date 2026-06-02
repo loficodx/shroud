@@ -504,7 +504,7 @@ relay:
 
 ---
 
-## 8. Закэшировать TLS connector на клиенте
+## 8. ~~Закэшировать TLS connector на клиенте~~
 
 ### Текущая проблема
 
@@ -553,7 +553,7 @@ let tls_connector = if config.tls {
 
 ---
 
-## 9. Добавить timeout на connect/handshake/sniff
+## 9. ~~Добавить timeout на connect/handshake/sniff~~
 
 ### Client-side timeout
 
@@ -584,7 +584,6 @@ raw_tcp response read timeout
 sniff raw_tcp magic timeout
 read raw_tcp connect request timeout
 target connect timeout
-relay idle timeout
 ```
 
 Особенно важно для server sniff:
@@ -595,9 +594,11 @@ timeout(SNIFF_TIMEOUT, read_exact(prefix)).await
 
 Иначе клиент может подключиться и зависнуть, удерживая task.
 
+`relay idle timeout` остается отдельной задачей из пункта 7: wall-clock timeout убран, настоящий activity-aware idle timeout пока не включен в datapath.
+
 ---
 
-## 10. Упростить server protocol detection
+## 10. ~~Упростить server protocol detection~~
 
 ### Цель
 
@@ -631,7 +632,7 @@ HTTP/3 не должен попадать в тот же TCP accept loop.
 
 ---
 
-## 11. Добавить target ACL на сервере
+## 11. ~~Добавить target ACL на сервере~~
 
 ### Почему это важно
 
@@ -664,7 +665,7 @@ security:
 
 ---
 
-## 12. Добавить лимиты concurrency
+## 12. ~~Добавить лимиты concurrency~~
 
 ### Client
 
@@ -1025,8 +1026,8 @@ relay errors
 
 - [x] Убрать wall-clock timeout вокруг `copy_bidirectional`.
 - [ ] Реализовать или отложить настоящий idle timeout.
-- [ ] Добавить sniff/read handshake timeout на сервере.
-- [ ] Добавить client connect/TLS/handshake timeouts.
+- [x] Добавить sniff/read handshake timeout на сервере.
+- [x] Добавить client connect/TLS/handshake timeouts.
 - [ ] Проверить half-close behavior.
 - [ ] Проверить корректный SOCKS response для unsupported commands.
 
@@ -1040,8 +1041,8 @@ relay errors
 
 ### Этап 5 — safety limits
 
-- [ ] Добавить server max concurrent connections.
-- [ ] Добавить client max concurrent connections.
+- [x] Добавить server max concurrent connections.
+- [x] Добавить client max concurrent connections.
 - [ ] Добавить target ACL/deny private IPs.
 - [ ] Добавить понятные close reasons в logs.
 - [ ] Добавить базовые metrics.
@@ -1084,7 +1085,7 @@ relay errors
 - [ ] Нет multiplexing/frame overhead в datapath.
 - [x] Нет wall-clock timeout, который убивает активные соединения.
 - [ ] TLS connector не пересобирается на каждый request.
-- [ ] Есть timeout на connect/handshake/sniff.
+- [x] Есть timeout на connect/handshake/sniff.
 - [ ] Есть лимит concurrent connections.
 - [ ] Есть базовый deny private IPs на server-side target connect.
 - [ ] Large download/upload работает стабильно.

@@ -1,37 +1,53 @@
 use crate::auth::validate_auth_bytes;
-use anyhow::{Context, Result};
-use shroud_core::config::AuthorizedClient;
+use anyhow::{Context, Result, anyhow};
+use shroud_core::config::{AuthorizedClient, ServerSecurityConfig, TimeoutsConfig};
 use shroud_core::tcp_handshake::{
     ClientAuthProof, TcpConnectStatus, read_raw_tcp_connect_request, write_raw_tcp_connect_status,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
 
-const RAW_TCP_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RAW_TCP_ALLOWED_TIMESTAMP_SKEW: Duration = Duration::from_secs(120);
 const RAW_TCP_RELAY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RawTcpServerState {
     clients: Vec<AuthorizedClient>,
+    request_read_timeout: Duration,
     target_connect_timeout: Duration,
+    security: ServerSecurityConfig,
     relay_buffer_size: usize,
     nonce_cache: Arc<RawTcpNonceCache>,
 }
 
 impl RawTcpServerState {
     pub fn new(clients: Vec<AuthorizedClient>) -> Self {
+        Self::with_timeouts(clients, TimeoutsConfig::default())
+    }
+
+    pub fn with_timeouts(clients: Vec<AuthorizedClient>, timeouts: TimeoutsConfig) -> Self {
+        Self::with_config(clients, timeouts, ServerSecurityConfig::default())
+    }
+
+    pub fn with_config(
+        clients: Vec<AuthorizedClient>,
+        timeouts: TimeoutsConfig,
+        security: ServerSecurityConfig,
+    ) -> Self {
         Self {
             clients,
-            target_connect_timeout: RAW_TCP_TARGET_CONNECT_TIMEOUT,
+            request_read_timeout: Duration::from_millis(timeouts.raw_tcp_handshake_ms),
+            target_connect_timeout: Duration::from_millis(timeouts.target_connect_ms),
+            security,
             relay_buffer_size: RAW_TCP_RELAY_BUFFER_SIZE,
             nonce_cache: Arc::new(RawTcpNonceCache::new(
                 RAW_TCP_ALLOWED_TIMESTAMP_SKEW.saturating_mul(2),
@@ -48,9 +64,19 @@ pub async fn handle_raw_tcp_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let req = match read_raw_tcp_connect_request(&mut inbound).await {
-        Ok(req) => req,
-        Err(err) => {
+    let req = match timeout(
+        state.request_read_timeout,
+        read_raw_tcp_connect_request(&mut inbound),
+    )
+    .await
+    {
+        Err(_) => {
+            let _ =
+                write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::InvalidRequest).await;
+            return Err(anyhow::anyhow!("timed out reading raw_tcp connect request"));
+        }
+        Ok(Ok(req)) => req,
+        Ok(Err(err)) => {
             let _ =
                 write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::InvalidRequest).await;
             return Err(err).context("failed to read raw_tcp connect request");
@@ -74,7 +100,7 @@ where
     let target_connect_started = Instant::now();
     let mut target = match timeout(
         state.target_connect_timeout,
-        TcpStream::connect((req.host.as_str(), req.port)),
+        connect_target(&req.host, req.port, &state.security),
     )
     .await
     {
@@ -89,6 +115,21 @@ where
                 target_port = req.port,
                 target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
                 "raw_tcp target connect timed out"
+            );
+            return Ok(());
+        }
+        Ok(Err(TargetConnectError::Forbidden(reason))) => {
+            write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::Forbidden)
+                .await
+                .context("failed to write raw_tcp target ACL status")?;
+            debug!(
+                %peer,
+                client_id = %req.auth.client_id,
+                target_host = %req.host,
+                target_port = req.port,
+                target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                reason,
+                "raw_tcp target blocked by ACL"
             );
             return Ok(());
         }
@@ -147,6 +188,84 @@ where
 
     Ok(())
 }
+
+async fn connect_target(
+    host: &str,
+    port: u16,
+    security: &ServerSecurityConfig,
+) -> Result<TcpStream, TargetConnectError> {
+    if !security.allow_ports.is_empty() && !security.allow_ports.contains(&port) {
+        return Err(TargetConnectError::Forbidden(
+            "target port is not in security.allow_ports".to_string(),
+        ));
+    }
+
+    let addresses: Vec<SocketAddr> = lookup_host((host, port))
+        .await
+        .map_err(|err| TargetConnectError::Connect(anyhow!(err).context("target DNS failed")))?
+        .collect();
+
+    if addresses.is_empty() {
+        return Err(TargetConnectError::Connect(anyhow!(
+            "target DNS returned no addresses"
+        )));
+    }
+
+    let mut allowed_addresses = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if target_ip_denied(address.ip(), security) {
+            continue;
+        }
+        allowed_addresses.push(address);
+    }
+
+    if allowed_addresses.is_empty() {
+        return Err(TargetConnectError::Forbidden(
+            "all resolved target addresses are denied".to_string(),
+        ));
+    }
+
+    let mut last_error = None;
+    for address in allowed_addresses {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(TargetConnectError::Connect(match last_error {
+        Some(err) => anyhow!(err).context("failed to connect to allowed target addresses"),
+        None => anyhow!("target DNS returned no allowed addresses"),
+    }))
+}
+
+fn target_ip_denied(ip: IpAddr, security: &ServerSecurityConfig) -> bool {
+    if !security.deny_private_ips {
+        return false;
+    }
+
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+#[derive(Debug)]
+enum TargetConnectError {
+    Forbidden(String),
+    Connect(anyhow::Error),
+}
+
+impl fmt::Display for TargetConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Forbidden(reason) => write!(f, "{reason}"),
+            Self::Connect(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for TargetConnectError {}
 
 async fn verify_raw_tcp_auth(state: &RawTcpServerState, auth: &ClientAuthProof) -> Result<bool> {
     let now = SystemTime::now()
@@ -251,7 +370,14 @@ mod tests {
     }
 
     fn state() -> RawTcpServerState {
-        RawTcpServerState::new(clients())
+        RawTcpServerState::with_config(
+            clients(),
+            TimeoutsConfig::default(),
+            ServerSecurityConfig {
+                deny_private_ips: false,
+                allow_ports: Vec::new(),
+            },
+        )
     }
 
     fn auth_proof(secret: &str) -> ClientAuthProof {
@@ -319,6 +445,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn times_out_when_connect_request_stalls() {
+        let (_client, server) = tokio::io::duplex(64 * 1024);
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let state = RawTcpServerState::with_timeouts(
+            clients(),
+            TimeoutsConfig {
+                raw_tcp_handshake_ms: 10,
+                ..TimeoutsConfig::default()
+            },
+        );
+
+        let err = handle_raw_tcp_connection(server, peer, state)
+            .await
+            .expect_err("raw_tcp request read should time out");
+
+        assert!(
+            err.to_string()
+                .contains("timed out reading raw_tcp connect request")
+        );
+    }
+
+    #[tokio::test]
     async fn returns_connect_failed_when_target_is_unavailable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = listener.local_addr().unwrap().port();
@@ -336,6 +484,54 @@ mod tests {
         .unwrap();
         let status = read_raw_tcp_connect_status(&mut client).await.unwrap();
         assert_eq!(status, TcpConnectStatus::ConnectFailed);
+
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn returns_forbidden_when_target_ip_is_denied_by_acl() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let server = tokio::spawn(handle_raw_tcp_connection(
+            server,
+            peer,
+            RawTcpServerState::new(clients()),
+        ));
+
+        write_raw_tcp_connect_request(
+            &mut client,
+            &TcpConnectRequest::new("127.0.0.1", 443, auth_proof(CLIENT_SECRET)),
+        )
+        .await
+        .unwrap();
+        let status = read_raw_tcp_connect_status(&mut client).await.unwrap();
+        assert_eq!(status, TcpConnectStatus::Forbidden);
+
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn returns_forbidden_when_target_port_is_not_allowed() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let state = RawTcpServerState::with_config(
+            clients(),
+            TimeoutsConfig::default(),
+            ServerSecurityConfig {
+                deny_private_ips: false,
+                allow_ports: vec![443],
+            },
+        );
+        let server = tokio::spawn(handle_raw_tcp_connection(server, peer, state));
+
+        write_raw_tcp_connect_request(
+            &mut client,
+            &TcpConnectRequest::new("203.0.113.7", 80, auth_proof(CLIENT_SECRET)),
+        )
+        .await
+        .unwrap();
+        let status = read_raw_tcp_connect_status(&mut client).await.unwrap();
+        assert_eq!(status, TcpConnectStatus::Forbidden);
 
         server.await.unwrap().unwrap();
     }

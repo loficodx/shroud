@@ -5,7 +5,8 @@ use shroud_client::transport;
 use shroud_client::transport::raw_tcp::connect_raw_tcp;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
-    RoutingConfig, RoutingRule, ServerConfig, ServerTlsConfig, TransportMode,
+    RoutingConfig, RoutingRule, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
+    TimeoutsConfig, TransportMode,
 };
 use shroud_server::web;
 use std::net::SocketAddr;
@@ -364,6 +365,12 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
             cert_path: Some(SERVER_CERT.to_string()),
             key_path: Some(SERVER_KEY.to_string()),
         },
+        timeouts: TimeoutsConfig::default(),
+        limits: Default::default(),
+        security: ServerSecurityConfig {
+            deny_private_ips: false,
+            allow_ports: Vec::new(),
+        },
         clients: vec![AuthorizedClient {
             client_id: CLIENT_ID.to_string(),
             client_secret: CLIENT_SECRET.to_string(),
@@ -406,11 +413,12 @@ async fn start_socks_client_with_dns(
         TransportMode::RawTcp,
         outbound_config(tunnel_addr, tunnel_path),
         auth_config(client_secret),
+        TimeoutsConfig::default(),
     )?;
     let session = SessionCore::new(router, tcp_transport, dns);
 
     let handle = tokio::spawn(async move {
-        let _ = socks5::serve(listen, session).await;
+        let _ = socks5::serve(listen, session, 4096).await;
     });
     wait_for_tcp(listen).await?;
     Ok(RunningTask {

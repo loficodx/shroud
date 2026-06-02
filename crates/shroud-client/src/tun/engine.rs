@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -19,15 +20,23 @@ pub struct TunEngine {
     session: SessionCore,
     fake_dns: FakeDns,
     mtu: u16,
+    max_concurrent_connections: usize,
 }
 
 impl TunEngine {
-    pub fn new(device: TunDevice, session: SessionCore, fake_dns: FakeDns, mtu: u16) -> Self {
+    pub fn new(
+        device: TunDevice,
+        session: SessionCore,
+        fake_dns: FakeDns,
+        mtu: u16,
+        max_concurrent_connections: usize,
+    ) -> Self {
         Self {
             device,
             session,
             fake_dns,
             mtu,
+            max_concurrent_connections,
         }
     }
 
@@ -37,6 +46,7 @@ impl TunEngine {
             session,
             fake_dns,
             mtu,
+            max_concurrent_connections,
         } = self;
         let tun_name = device.name().to_string();
         let file = device.into_file();
@@ -82,7 +92,12 @@ impl TunEngine {
             Ok::<_, anyhow::Error>(())
         });
 
-        let tcp_dispatch = tokio::spawn(run_tcp_dispatcher(session, fake_dns, tcp_listener));
+        let tcp_dispatch = tokio::spawn(run_tcp_dispatcher(
+            session,
+            fake_dns,
+            tcp_listener,
+            max_concurrent_connections,
+        ));
 
         tokio::select! {
             result = stack_to_tun => result.context("TUN stack-to-device task failed")??,
@@ -124,11 +139,22 @@ async fn run_tcp_dispatcher(
     session: SessionCore,
     fake_dns: FakeDns,
     mut tcp_listener: TcpListener,
+    max_concurrent_connections: usize,
 ) -> Result<()> {
+    let connection_slots = Arc::new(Semaphore::new(max_concurrent_connections));
+    info!(max_concurrent_connections, "TUN TCP dispatcher started");
+
     while let Some((stream, source, destination)) = tcp_listener.next().await {
         let session = session.clone();
         let fake_dns = fake_dns.clone();
+        let permit = connection_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("TUN TCP connection limit semaphore closed")?;
+
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) =
                 handle_tcp_stream(session, fake_dns, stream, source, destination).await
             {

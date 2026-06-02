@@ -13,6 +13,8 @@ pub struct ClientConfig {
     pub transport: TransportConfig,
     pub outbound: OutboundConfig,
     pub auth: ClientAuthConfig,
+    pub timeouts: TimeoutsConfig,
+    pub limits: LimitsConfig,
     pub routing: RoutingConfig,
     pub dns: ClientDnsConfig,
     #[serde(skip_serializing)]
@@ -72,6 +74,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
 
         let auth = raw.auth.unwrap_or_default();
 
+        let timeouts = raw.timeouts.unwrap_or_default();
+        let limits = raw.limits.unwrap_or_default();
         let routing = raw.routing.unwrap_or_default();
         let dns = raw.dns.unwrap_or_default();
 
@@ -81,6 +85,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
             transport,
             outbound,
             auth,
+            timeouts,
+            limits,
             routing,
             dns,
             transport_source,
@@ -224,6 +230,46 @@ pub struct TransportConfig {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    #[serde(default = "default_server_connect_ms")]
+    pub server_connect_ms: u64,
+    #[serde(default = "default_tls_handshake_ms")]
+    pub tls_handshake_ms: u64,
+    #[serde(default = "default_raw_tcp_handshake_ms")]
+    pub raw_tcp_handshake_ms: u64,
+    #[serde(default = "default_target_connect_ms")]
+    pub target_connect_ms: u64,
+    #[serde(default = "default_idle_timeout_sec")]
+    pub idle_timeout_sec: u64,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            server_connect_ms: default_server_connect_ms(),
+            tls_handshake_ms: default_tls_handshake_ms(),
+            raw_tcp_handshake_ms: default_raw_tcp_handshake_ms(),
+            target_connect_ms: default_target_connect_ms(),
+            idle_timeout_sec: default_idle_timeout_sec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_concurrent_connections: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_connections: default_max_concurrent_connections(),
+        }
+    }
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
@@ -258,6 +304,30 @@ fn default_mode() -> TransportMode {
 
 fn default_legacy_tunnel_path() -> String {
     "/api/tunnel".to_string()
+}
+
+fn default_server_connect_ms() -> u64 {
+    10_000
+}
+
+fn default_tls_handshake_ms() -> u64 {
+    10_000
+}
+
+fn default_raw_tcp_handshake_ms() -> u64 {
+    5_000
+}
+
+fn default_target_connect_ms() -> u64 {
+    10_000
+}
+
+fn default_idle_timeout_sec() -> u64 {
+    300
+}
+
+fn default_max_concurrent_connections() -> usize {
+    4096
 }
 
 fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
@@ -376,6 +446,12 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls: ServerTlsConfig,
     #[serde(default)]
+    pub timeouts: TimeoutsConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
+    pub security: ServerSecurityConfig,
+    #[serde(default)]
     pub clients: Vec<AuthorizedClient>,
 }
 
@@ -395,6 +471,23 @@ impl Default for ServerTransportConfig {
 
 fn default_server_modes() -> Vec<TransportMode> {
     vec![TransportMode::RawTcp]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSecurityConfig {
+    #[serde(default = "default_true")]
+    pub deny_private_ips: bool,
+    #[serde(default)]
+    pub allow_ports: Vec<u16>,
+}
+
+impl Default for ServerSecurityConfig {
+    fn default() -> Self {
+        Self {
+            deny_private_ips: true,
+            allow_ports: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -544,6 +637,8 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
         }
     }
     validate_client_auth_config(&mut errors, "auth", &config.auth);
+    validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
+    validate_limits_config(&mut errors, "limits", &config.limits);
     validate_routing_config_into(&mut errors, "routing.rules", &config.routing);
 
     finish_validation(errors)
@@ -600,8 +695,55 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
         validate_authorized_client_config(&mut errors, &format!("clients[{index}]"), client);
     }
     validate_server_transport_config(&mut errors, "transport", &config.transport);
+    validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
+    validate_limits_config(&mut errors, "limits", &config.limits);
+    validate_server_security_config(&mut errors, "security", &config.security);
 
     finish_validation(errors)
+}
+
+fn validate_timeouts_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    timeouts: &TimeoutsConfig,
+) {
+    validate_positive_u64(
+        errors,
+        &format!("{base_path}.server_connect_ms"),
+        timeouts.server_connect_ms,
+    );
+    validate_positive_u64(
+        errors,
+        &format!("{base_path}.tls_handshake_ms"),
+        timeouts.tls_handshake_ms,
+    );
+    validate_positive_u64(
+        errors,
+        &format!("{base_path}.raw_tcp_handshake_ms"),
+        timeouts.raw_tcp_handshake_ms,
+    );
+    validate_positive_u64(
+        errors,
+        &format!("{base_path}.target_connect_ms"),
+        timeouts.target_connect_ms,
+    );
+    validate_positive_u64(
+        errors,
+        &format!("{base_path}.idle_timeout_sec"),
+        timeouts.idle_timeout_sec,
+    );
+}
+
+fn validate_limits_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    limits: &LimitsConfig,
+) {
+    validate_positive_usize(
+        errors,
+        &format!("{base_path}.max_concurrent_connections"),
+        limits.max_concurrent_connections,
+    );
 }
 
 pub fn validate_routing_config(config: &RoutingConfig) -> Result<(), ConfigValidationError> {
@@ -670,6 +812,21 @@ fn validate_server_transport_config(
                 format!("{base_path}.modes"),
                 "http3 transport is reserved but not implemented yet",
             )),
+        }
+    }
+}
+
+fn validate_server_security_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    security: &ServerSecurityConfig,
+) {
+    for (index, port) in security.allow_ports.iter().enumerate() {
+        if *port == 0 {
+            errors.push(ConfigFieldError::new(
+                format!("{base_path}.allow_ports[{index}]"),
+                "port must be greater than 0",
+            ));
         }
     }
 }
@@ -810,6 +967,18 @@ fn validate_non_empty(errors: &mut Vec<ConfigFieldError>, path: &str, value: &st
     }
 }
 
+fn validate_positive_u64(errors: &mut Vec<ConfigFieldError>, path: &str, value: u64) {
+    if value == 0 {
+        errors.push(ConfigFieldError::new(path, "must be greater than 0"));
+    }
+}
+
+fn validate_positive_usize(errors: &mut Vec<ConfigFieldError>, path: &str, value: usize) {
+    if value == 0 {
+        errors.push(ConfigFieldError::new(path, "must be greater than 0"));
+    }
+}
+
 fn finish_validation(errors: Vec<ConfigFieldError>) -> Result<(), ConfigValidationError> {
     if errors.is_empty() {
         Ok(())
@@ -839,6 +1008,10 @@ struct ClientConfigRaw {
     outbounds: Option<ClientOutboundsRaw>,
     #[serde(default)]
     auth: Option<ClientAuthConfig>,
+    #[serde(default)]
+    timeouts: Option<TimeoutsConfig>,
+    #[serde(default)]
+    limits: Option<LimitsConfig>,
     #[serde(default)]
     routing: Option<RoutingConfig>,
     #[serde(default)]
@@ -921,6 +1094,59 @@ auth:
         assert_eq!(cfg.outbound.server, "127.0.0.1");
         assert_eq!(cfg.outbound.port, 8443);
         assert_eq!(cfg.outbound.path, "/api/tunnel");
+        assert_eq!(cfg.timeouts.server_connect_ms, 10_000);
+        assert_eq!(cfg.timeouts.tls_handshake_ms, 10_000);
+        assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
+        assert_eq!(cfg.timeouts.target_connect_ms, 10_000);
+        assert_eq!(cfg.timeouts.idle_timeout_sec, 300);
+        assert_eq!(cfg.limits.max_concurrent_connections, 4096);
+    }
+
+    #[test]
+    fn client_config_accepts_timeout_overrides() {
+        let raw = format!(
+            "{BASE_CLIENT_TRANSPORT_CONFIG}\ntimeouts:\n  server_connect_ms: 1\n  tls_handshake_ms: 2\n  raw_tcp_handshake_ms: 3\n  target_connect_ms: 4\n  idle_timeout_sec: 5\n"
+        );
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(cfg.timeouts.server_connect_ms, 1);
+        assert_eq!(cfg.timeouts.tls_handshake_ms, 2);
+        assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 3);
+        assert_eq!(cfg.timeouts.target_connect_ms, 4);
+        assert_eq!(cfg.timeouts.idle_timeout_sec, 5);
+    }
+
+    #[test]
+    fn client_config_rejects_zero_timeout() {
+        let raw = format!("{BASE_CLIENT_TRANSPORT_CONFIG}\ntimeouts:\n  raw_tcp_handshake_ms: 0\n");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("timeouts.raw_tcp_handshake_ms"));
+    }
+
+    #[test]
+    fn client_config_accepts_limit_overrides() {
+        let raw =
+            format!("{BASE_CLIENT_TRANSPORT_CONFIG}\nlimits:\n  max_concurrent_connections: 64\n");
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(cfg.limits.max_concurrent_connections, 64);
+    }
+
+    #[test]
+    fn client_config_rejects_zero_connection_limit() {
+        let raw =
+            format!("{BASE_CLIENT_TRANSPORT_CONFIG}\nlimits:\n  max_concurrent_connections: 0\n");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(
+            err.to_string()
+                .contains("limits.max_concurrent_connections")
+        );
     }
 
     #[test]
@@ -985,6 +1211,90 @@ clients:
         let cfg = load_server_config_yaml(raw).expect("valid config");
 
         assert_eq!(cfg.transport.modes, vec![TransportMode::RawTcp]);
+        assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
+        assert_eq!(cfg.limits.max_concurrent_connections, 4096);
+        assert!(cfg.security.deny_private_ips);
+        assert!(cfg.security.allow_ports.is_empty());
+    }
+
+    #[test]
+    fn server_config_accepts_limit_overrides() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+limits:
+  max_concurrent_connections: 128
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert_eq!(cfg.limits.max_concurrent_connections, 128);
+    }
+
+    #[test]
+    fn server_config_rejects_zero_connection_limit() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+limits:
+  max_concurrent_connections: 0
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(
+            err.to_string()
+                .contains("limits.max_concurrent_connections")
+        );
+    }
+
+    #[test]
+    fn server_config_accepts_security_acl_overrides() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+security:
+  deny_private_ips: false
+  allow_ports:
+    - 80
+    - 443
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert!(!cfg.security.deny_private_ips);
+        assert_eq!(cfg.security.allow_ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn server_config_rejects_zero_acl_port() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+security:
+  allow_ports:
+    - 0
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("security.allow_ports[0]"));
     }
 
     #[test]

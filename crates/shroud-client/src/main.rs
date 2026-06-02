@@ -52,9 +52,13 @@ async fn main() -> Result<()> {
     let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
 
     if cfg.inbounds.tun.enabled {
-        let tcp_transport =
-            transport::build_tcp_transport(cfg.transport.mode, outbound.clone(), cfg.auth.clone())
-                .context("failed to build TCP transport")?;
+        let tcp_transport = transport::build_tcp_transport(
+            cfg.transport.mode,
+            outbound.clone(),
+            cfg.auth.clone(),
+            cfg.timeouts,
+        )
+        .context("failed to build TCP transport")?;
         let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone());
         let device = tun::device::open(&cfg.inbounds.tun)
             .with_context(|| format!("failed to set up TUN device {}", cfg.inbounds.tun.name))?;
@@ -76,9 +80,15 @@ async fn main() -> Result<()> {
         tokio::spawn(tun::dns::serve(fake_dns_addr, fake_dns.clone()));
 
         info!(tun = device.name(), "starting TUN packet engine");
-        return tun::engine::TunEngine::new(device, session, fake_dns, cfg.inbounds.tun.mtu)
-            .run()
-            .await;
+        return tun::engine::TunEngine::new(
+            device,
+            session,
+            fake_dns,
+            cfg.inbounds.tun.mtu,
+            cfg.limits.max_concurrent_connections,
+        )
+        .run()
+        .await;
     }
 
     let socks = cfg
@@ -90,12 +100,16 @@ async fn main() -> Result<()> {
 
     info!(listen = %socks.listen, "starting shroud client");
 
-    let tcp_transport =
-        transport::build_tcp_transport(cfg.transport.mode, outbound.clone(), cfg.auth.clone())
-            .context("failed to build TCP transport")?;
+    let tcp_transport = transport::build_tcp_transport(
+        cfg.transport.mode,
+        outbound.clone(),
+        cfg.auth.clone(),
+        cfg.timeouts,
+    )
+    .context("failed to build TCP transport")?;
     let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone());
 
-    socks5::serve(socks.listen, session).await
+    socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
 fn parse_cli() -> Result<Option<String>> {

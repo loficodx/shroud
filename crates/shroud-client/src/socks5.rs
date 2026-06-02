@@ -1,9 +1,11 @@
 use crate::session::{DnsPolicyResult, SessionContext, SessionCore, TcpOpenResult};
 use anyhow::{Context, Result, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -12,9 +14,18 @@ const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn serve(listen: SocketAddr, session: SessionCore) -> Result<()> {
+pub async fn serve(
+    listen: SocketAddr,
+    session: SessionCore,
+    max_concurrent_connections: usize,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    info!(%listen, "SOCKS5 inbound listener started");
+    let connection_slots = Arc::new(Semaphore::new(max_concurrent_connections));
+    info!(
+        %listen,
+        max_concurrent_connections,
+        "SOCKS5 inbound listener started"
+    );
     let mut active = JoinSet::new();
 
     loop {
@@ -32,8 +43,14 @@ pub async fn serve(listen: SocketAddr, session: SessionCore) -> Result<()> {
                 debug!(%peer, "new connection");
 
                 let session = session.clone();
+                let permit = connection_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("SOCKS5 connection limit semaphore closed")?;
 
                 active.spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = handle_connection(socket, peer, session).await {
                         debug!(%peer, error = %err, "connection handling failed");
                     }

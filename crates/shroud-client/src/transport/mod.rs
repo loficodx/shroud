@@ -5,7 +5,7 @@ pub mod tls;
 
 use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
-use shroud_core::config::{ClientAuthConfig, OutboundConfig, TransportMode};
+use shroud_core::config::{ClientAuthConfig, OutboundConfig, TimeoutsConfig, TransportMode};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -39,9 +39,12 @@ pub fn build_tcp_transport(
     mode: TransportMode,
     outbound: OutboundConfig,
     auth: ClientAuthConfig,
+    timeouts: TimeoutsConfig,
 ) -> Result<Arc<dyn TcpTransport>> {
     match mode {
-        TransportMode::RawTcp => Ok(Arc::new(raw_tcp::RawTcpTransport::new(outbound, auth))),
+        TransportMode::RawTcp => Ok(Arc::new(raw_tcp::RawTcpTransport::with_timeouts(
+            outbound, auth, timeouts,
+        )?)),
         TransportMode::Http2 => bail!("http2 transport is reserved but not implemented yet"),
         TransportMode::Http3 => bail!("http3 transport is reserved but not implemented yet"),
     }

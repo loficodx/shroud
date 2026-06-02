@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -34,11 +34,14 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
-    let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
+    let raw_tcp_state =
+        RawTcpServerState::with_config(cfg.clients.clone(), cfg.timeouts, cfg.security.clone());
+    let connection_slots = Arc::new(Semaphore::new(cfg.limits.max_concurrent_connections));
     let mut active = JoinSet::new();
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
+        max_concurrent_connections = cfg.limits.max_concurrent_connections,
         "server listener started"
     );
 
@@ -59,12 +62,31 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                 let tls_acceptor = tls_acceptor.clone();
                 let nonce_cache = nonce_cache.clone();
                 let raw_tcp_state = raw_tcp_state.clone();
+                let permit = connection_slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("server connection limit semaphore closed")?;
 
                 active.spawn(async move {
+                    let _permit = permit;
                     let result = if let Some(acceptor) = tls_acceptor {
                         let tls_started = Instant::now();
-                        match acceptor.accept(stream).await {
-                            Ok(stream) => {
+                        match timeout(
+                            Duration::from_millis(cfg.timeouts.tls_handshake_ms),
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                debug!(
+                                    %peer,
+                                    tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
+                                    "server TLS handshake timed out"
+                                );
+                                Err(anyhow!("tls handshake timed out"))
+                            }
+                            Ok(Ok(stream)) => {
                                 debug!(
                                     %peer,
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
@@ -72,7 +94,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                 );
                                 handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
                             }
-                            Err(err) => {
+                            Ok(Err(err)) => {
                                 debug!(
                                     %peer,
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
@@ -123,12 +145,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if cfg.transport.modes.contains(&TransportMode::RawTcp) {
-        let (stream, is_raw_tcp) = sniff_raw_tcp_magic(stream).await?;
+        let (stream, is_raw_tcp) = sniff_raw_tcp_magic(
+            stream,
+            Duration::from_millis(cfg.timeouts.raw_tcp_handshake_ms),
+        )
+        .await?;
         if is_raw_tcp {
             return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
         }
 
-        return handle_http_connection(stream, peer, cfg, nonce_cache).await;
+        debug!(%peer, "rejecting unsupported server protocol");
+        bail!("unsupported server protocol");
     }
 
     handle_http_connection(stream, peer, cfg, nonce_cache).await
@@ -170,14 +197,17 @@ where
     Ok(())
 }
 
-async fn sniff_raw_tcp_magic<S>(mut stream: S) -> Result<(PrefixedStream<S>, bool)>
+async fn sniff_raw_tcp_magic<S>(
+    mut stream: S,
+    sniff_timeout: Duration,
+) -> Result<(PrefixedStream<S>, bool)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut prefix = [0u8; RAW_TCP_MAGIC.len()];
-    stream
-        .read_exact(&mut prefix)
+    timeout(sniff_timeout, stream.read_exact(&mut prefix))
         .await
+        .context("timed out reading connection prefix")?
         .context("failed to read connection prefix")?;
     let is_raw_tcp = prefix == RAW_TCP_MAGIC;
     Ok((PrefixedStream::new(stream, prefix.to_vec()), is_raw_tcp))
@@ -699,7 +729,7 @@ fn optional_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::config::{AuthorizedClient, ServerTlsConfig};
+    use shroud_core::config::{AuthorizedClient, ServerSecurityConfig, ServerTlsConfig};
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -735,6 +765,73 @@ mod tests {
     #[test]
     fn decode_nonce_rejects_non_base64_header_chars() {
         assert!(decode_nonce("!!!!!!!!!!!!!!invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_tcp_sniff_times_out_when_prefix_stalls() {
+        let (_client, server) = tokio::io::duplex(64);
+
+        let err = match sniff_raw_tcp_magic(server, Duration::from_millis(10)).await {
+            Ok(_) => panic!("sniff unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("timed out reading connection prefix")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_rejects_non_raw_tcp_prefix_when_raw_tcp_is_enabled() {
+        let web_root = TempWebRoot::new();
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let cfg = ServerConfig {
+            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            tunnel_path: "/api/tunnel".to_string(),
+            web_root: web_root.path.to_string_lossy().into_owned(),
+            transport: Default::default(),
+            tls: ServerTlsConfig::default(),
+            timeouts: Default::default(),
+            limits: Default::default(),
+            security: ServerSecurityConfig::default(),
+            clients: vec![AuthorizedClient {
+                client_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                client_secret: "test-secret".to_string(),
+            }],
+        };
+        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
+        let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
+
+        let handle = tokio::spawn(async move {
+            handle_connection(
+                server,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+                cfg,
+                nonce_cache,
+                raw_tcp_state,
+            )
+            .await
+        });
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+        client.shutdown().await.expect("shutdown request");
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let err = handle
+            .await
+            .expect("join handler")
+            .expect_err("non-raw_tcp prefix should be rejected");
+
+        assert!(response.is_empty());
+        assert!(err.to_string().contains("unsupported server protocol"));
     }
 
     #[tokio::test]
@@ -954,21 +1051,22 @@ mod tests {
             web_root: web_root.path.to_string_lossy().into_owned(),
             transport: Default::default(),
             tls: ServerTlsConfig::default(),
+            timeouts: Default::default(),
+            limits: Default::default(),
+            security: ServerSecurityConfig::default(),
             clients: vec![AuthorizedClient {
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),
             }],
         };
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
-        let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
 
         let handle = tokio::spawn(async move {
-            handle_connection(
+            handle_http_connection(
                 server,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
                 nonce_cache,
-                raw_tcp_state,
             )
             .await
         });
