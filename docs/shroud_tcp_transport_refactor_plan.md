@@ -294,7 +294,7 @@ server:
 
 # Этапы реализации
 
-## Этап 0. Создать baseline-ветку и зафиксировать текущие тесты
+## ~~Этап 0. Создать baseline-ветку и зафиксировать текущие тесты~~
 
 Цель: иметь точку сравнения до удаления multiplexing/custom frames.
 
@@ -334,7 +334,7 @@ Notes
 
 ---
 
-## Этап 1. Ввести новый transport config
+## ~~Этап 1. Ввести новый transport config~~
 
 Цель: убрать неявную логику `multiplex: bool` как переключатель основной архитектуры.
 
@@ -404,7 +404,7 @@ outbound.path with custom HTTP Upgrade is deprecated
 
 ---
 
-## Этап 2. Вынести transport layer в отдельные модули
+## ~~Этап 2. Вынести transport layer в отдельные модули~~
 
 Цель: прекратить смешивать SOCKS/session logic, HTTP Upgrade, auth, TLS и relay в одном `tunnel.rs`.
 
@@ -474,7 +474,7 @@ SOCKS request -> transport.connect(target) -> raw relay
 
 ---
 
-## Этап 3. Реализовать `fast_tcp` handshake без `FrameType`
+## ~~Этап 3. Реализовать `fast_tcp` handshake без `FrameType`~~
 
 Цель: заменить `TcpConnect` frame на простой одноразовый binary handshake.
 
@@ -566,7 +566,7 @@ where
 
 ---
 
-## Этап 4. Реализовать client `fast_tcp`
+## ~~Этап 4. Реализовать client `fast_tcp`~~
 
 Цель: client открывает transport connection, отправляет handshake, получает `OK`, возвращает raw stream.
 
@@ -617,7 +617,7 @@ Client может получить raw tunnel stream без `write_frame/read_fr
 
 ---
 
-## Этап 5. Реализовать server `fast_tcp`
+## ~~Этап 5. Реализовать server `fast_tcp`~~
 
 Цель: server принимает connection, читает handshake, подключается к target, возвращает status, запускает raw relay.
 

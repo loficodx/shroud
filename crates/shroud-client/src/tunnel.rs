@@ -150,6 +150,10 @@ impl TunnelClient {
         Self { outbound, auth }
     }
 
+    pub(crate) fn transport_parts(&self) -> (OutboundConfig, ClientAuthConfig) {
+        (self.outbound.clone(), self.auth.clone())
+    }
+
     pub async fn connect_target_via_tunnel(
         &self,
         target_host: &str,
