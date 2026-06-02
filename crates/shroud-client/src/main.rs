@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use shroud_client::{routing, session, socks5, transport, tun, tunnel, tunnel_manager};
+use shroud_client::{routing, session, socks5, transport, tun, tunnel};
 use shroud_core::config::{generate_client_credentials, load_client_config_yaml};
 use std::fs;
 use tracing::{info, warn};
@@ -100,20 +100,11 @@ async fn main() -> Result<()> {
     info!(listen = %socks.listen, "starting shroud client");
 
     let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
-    let session = if outbound.multiplex {
-        let tunnel_pool = tunnel_manager::TunnelPool::connect(outbound.clone(), cfg.auth.clone())
-            .await
-            .context("failed to connect persistent tunnel pool")?;
-        session::SessionCore::new_multiplexed(router, tunnel, tunnel_pool, cfg.dns.clone())
-    } else {
-        let tcp_transport = transport::build_tcp_transport(
-            cfg.transport.tcp_mode,
-            outbound.clone(),
-            cfg.auth.clone(),
-        )
-        .context("failed to build TCP transport")?;
-        session::SessionCore::new_with_transport(router, tunnel, tcp_transport, cfg.dns.clone())
-    };
+    let tcp_transport =
+        transport::build_tcp_transport(cfg.transport.tcp_mode, outbound.clone(), cfg.auth.clone())
+            .context("failed to build TCP transport")?;
+    let session =
+        session::SessionCore::new_with_transport(router, tunnel, tcp_transport, cfg.dns.clone());
 
     socks5::serve(socks.listen, session).await
 }

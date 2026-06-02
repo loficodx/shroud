@@ -20,9 +20,6 @@ const HTTP_UPGRADE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct LegacyHttpTransport {
     pub stream: BoxedIo,
-    pub server_tcp_connect_ms: u64,
-    pub tls_handshake_ms: Option<u64>,
-    pub http_upgrade_ms: u64,
 }
 
 pub(crate) async fn open_legacy_http_upgrade_transport(
@@ -66,7 +63,6 @@ pub(crate) async fn open_legacy_http_upgrade_transport(
         )
     })?;
 
-    let mut tls_handshake_ms = None;
     let mut stream: BoxedIo = if outbound.tls {
         let tls_started = Instant::now();
         let connector = TlsConnector::from(Arc::new(build_tls_client_config(outbound)?));
@@ -95,7 +91,6 @@ pub(crate) async fn open_legacy_http_upgrade_transport(
             )
         })?;
         let elapsed_ms = elapsed_millis(tls_started.elapsed());
-        tls_handshake_ms = Some(elapsed_ms);
         debug!(
             server = %outbound.server,
             port = outbound.port,
@@ -159,12 +154,7 @@ pub(crate) async fn open_legacy_http_upgrade_transport(
         "tunnel upgrade accepted"
     );
 
-    Ok(LegacyHttpTransport {
-        stream,
-        server_tcp_connect_ms,
-        tls_handshake_ms,
-        http_upgrade_ms,
-    })
+    Ok(LegacyHttpTransport { stream })
 }
 
 fn elapsed_millis(elapsed: Duration) -> u64 {

@@ -1,5 +1,5 @@
 use crate::auth::validate_auth;
-use crate::relay::{relay_multiplexed_tunnel_with_config, relay_tunnel};
+use crate::relay::relay_tunnel;
 use crate::transport::fast_tcp::{FastTcpServerState, handle_fast_tcp_connection};
 use crate::transport::tls::build_tls_acceptor;
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,7 +39,6 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
-        multiplex = cfg.multiplex.enabled,
         "server listener started"
     );
 
@@ -333,11 +332,7 @@ where
         http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed()),
         "server HTTP upgrade accepted"
     );
-    if cfg.multiplex.enabled {
-        relay_multiplexed_tunnel_with_config(stream, peer, cfg.multiplex.clone()).await?;
-    } else {
-        relay_tunnel(stream, peer).await?;
-    }
+    relay_tunnel(stream, peer).await?;
     Ok(())
 }
 
@@ -959,7 +954,6 @@ mod tests {
             web_root: web_root.path.to_string_lossy().into_owned(),
             transport: Default::default(),
             tls: ServerTlsConfig::default(),
-            multiplex: Default::default(),
             clients: vec![AuthorizedClient {
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),

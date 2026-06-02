@@ -2,14 +2,12 @@ use crate::routing::Router;
 use crate::transport::fast_tcp::FastTcpTransport;
 use crate::transport::{BoxedIo, TcpTransport, TcpTransportMetrics};
 use crate::tunnel::{RelayStats, TunnelClient, UdpTunnel};
-use crate::tunnel_manager::{TunnelPool, TunnelStreamHandle};
-use anyhow::{Context, Result, bail};
-use bytes::Bytes;
+use anyhow::{Context, Result};
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -23,7 +21,6 @@ pub struct SessionCore {
     router: Router,
     tunnel: TunnelClient,
     tcp_transport: Arc<dyn TcpTransport>,
-    tunnel_pool: Option<TunnelPool>,
     dns: ClientDnsConfig,
 }
 
@@ -43,23 +40,6 @@ impl SessionCore {
             router,
             tunnel,
             tcp_transport,
-            tunnel_pool: None,
-            dns,
-        }
-    }
-
-    pub fn new_multiplexed(
-        router: Router,
-        tunnel: TunnelClient,
-        tunnel_pool: TunnelPool,
-        dns: ClientDnsConfig,
-    ) -> Self {
-        let tcp_transport = Arc::new(FastTcpTransport::from_tunnel(tunnel.clone()));
-        Self {
-            router,
-            tunnel,
-            tcp_transport,
-            tunnel_pool: Some(tunnel_pool),
             dns,
         }
     }
@@ -104,7 +84,7 @@ impl SessionCore {
     }
 
     pub fn supports_udp_associate(&self) -> bool {
-        self.tunnel_pool.is_none()
+        true
     }
 
     pub async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpOpenResult> {
@@ -112,18 +92,6 @@ impl SessionCore {
 
         match action {
             RouteAction::Proxy => {
-                if let Some(tunnel_pool) = &self.tunnel_pool {
-                    let stream = tunnel_pool
-                        .open_tcp_stream(target_host, target_port)
-                        .await
-                        .context("proxy multiplexed tunnel connect failed")?;
-                    return Ok(TcpOpenResult::Opened(TcpOutbound {
-                        action,
-                        metrics: TcpOpenMetrics::default(),
-                        stream: TcpOutboundStream::MultiplexedProxy(stream),
-                    }));
-                }
-
                 let transport = self
                     .tcp_transport
                     .connect(target_host, target_port)
@@ -172,10 +140,6 @@ impl SessionCore {
     }
 
     pub async fn open_udp_tunnel(&self) -> Result<UdpTunnel> {
-        if !self.supports_udp_associate() {
-            bail!("SOCKS UDP ASSOCIATE is not supported in multiplexed TCP-only MVP mode");
-        }
-
         self.tunnel
             .open_udp_association()
             .await
@@ -195,14 +159,6 @@ impl SessionCore {
                 .relay_raw_tcp(client_stream, &mut upstream)
                 .await
                 .context("proxy relay failed"),
-            TcpOutboundStream::MultiplexedProxy(upstream) => {
-                let stream_id = upstream.stream_id();
-                relay_multiplexed_tcp(client_stream, upstream)
-                    .await
-                    .with_context(|| {
-                        format!("multiplexed proxy relay failed for stream {stream_id}")
-                    })
-            }
             TcpOutboundStream::Direct(mut upstream) => self
                 .relay_raw_tcp(client_stream, &mut upstream)
                 .await
@@ -219,167 +175,23 @@ impl SessionCore {
         S: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
     {
-        let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-        let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-
-        let client_to_upstream = async {
-            let mut transferred = 0u64;
-            let mut buf = [0u8; COPY_BUF_SIZE];
-
-            loop {
-                let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
-                    .await
-                    .context("relay idle timeout while reading from client")??;
-                if n == 0 {
-                    timeout(RELAY_IDLE_TIMEOUT, upstream_write.shutdown())
-                        .await
-                        .context("relay timeout while shutting down upstream writer")??;
-                    break;
-                }
-
-                transferred += n as u64;
-                timeout(RELAY_IDLE_TIMEOUT, upstream_write.write_all(&buf[..n]))
-                    .await
-                    .context("relay timeout while writing to upstream")??;
-            }
-
-            Ok::<u64, anyhow::Error>(transferred)
-        };
-
-        let upstream_to_client = async {
-            let mut transferred = 0u64;
-            let mut buf = [0u8; COPY_BUF_SIZE];
-
-            loop {
-                let n = timeout(RELAY_IDLE_TIMEOUT, upstream_read.read(&mut buf))
-                    .await
-                    .context("relay idle timeout while reading from upstream")??;
-                if n == 0 {
-                    timeout(RELAY_IDLE_TIMEOUT, client_write.shutdown())
-                        .await
-                        .context("relay timeout while shutting down client writer")??;
-                    break;
-                }
-
-                transferred += n as u64;
-                timeout(RELAY_IDLE_TIMEOUT, client_write.write_all(&buf[..n]))
-                    .await
-                    .context("relay timeout while writing to client")??;
-            }
-
-            Ok::<u64, anyhow::Error>(transferred)
-        };
-
-        let (client_to_upstream_bytes, upstream_to_client_bytes) =
-            tokio::try_join!(client_to_upstream, upstream_to_client)?;
+        let (client_to_upstream_bytes, upstream_to_client_bytes) = timeout(
+            RELAY_IDLE_TIMEOUT,
+            tokio::io::copy_bidirectional_with_sizes(
+                client_stream,
+                upstream,
+                COPY_BUF_SIZE,
+                COPY_BUF_SIZE,
+            ),
+        )
+        .await
+        .context("relay idle timeout")?
+        .context("raw TCP relay failed")?;
 
         Ok(RelayStats {
             client_to_upstream_bytes,
             upstream_to_client_bytes,
         })
-    }
-}
-
-async fn relay_multiplexed_tcp<S>(
-    client_stream: &mut S,
-    stream: TunnelStreamHandle,
-) -> Result<RelayStats>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let stream_id = stream.stream_id();
-    let tunnel_id = stream.tunnel_id();
-    let target_host = stream.target_host().to_owned();
-    let target_port = stream.target_port();
-    let opened_at = stream.opened_at();
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut tunnel_read, tunnel_write) = stream.into_split();
-
-    let client_to_tunnel = async {
-        let mut transferred = 0u64;
-        let mut buf = [0u8; COPY_BUF_SIZE];
-
-        loop {
-            let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
-                .await
-                .context("relay idle timeout while reading from client")??;
-            if n == 0 {
-                timeout(RELAY_IDLE_TIMEOUT, tunnel_write.close())
-                    .await
-                    .context("relay timeout while closing multiplexed stream")??;
-                break;
-            }
-
-            transferred += n as u64;
-            timeout(
-                RELAY_IDLE_TIMEOUT,
-                tunnel_write.send_data(Bytes::copy_from_slice(&buf[..n])),
-            )
-            .await
-            .context("relay timeout while queueing TCP_DATA to multiplexed stream")??;
-        }
-
-        Ok::<u64, anyhow::Error>(transferred)
-    };
-
-    let tunnel_to_client = async {
-        let mut transferred = 0u64;
-
-        while let Some(bytes) = timeout(RELAY_IDLE_TIMEOUT, tunnel_read.recv_data())
-            .await
-            .context("relay idle timeout while reading from multiplexed stream")?
-        {
-            transferred += bytes.len() as u64;
-            timeout(RELAY_IDLE_TIMEOUT, client_write.write_all(bytes.as_ref()))
-                .await
-                .context("relay timeout while writing to client")??;
-        }
-
-        timeout(RELAY_IDLE_TIMEOUT, client_write.shutdown())
-            .await
-            .context("relay timeout while shutting down client writer")??;
-        Ok::<u64, anyhow::Error>(transferred)
-    };
-
-    let result = tokio::try_join!(client_to_tunnel, tunnel_to_client);
-    let active_streams = tunnel_write.cleanup_local().await;
-    let relay_elapsed = opened_at.elapsed();
-    match result {
-        Ok((client_to_upstream_bytes, upstream_to_client_bytes)) => {
-            let stats = RelayStats {
-                client_to_upstream_bytes,
-                upstream_to_client_bytes,
-            };
-
-            debug!(
-                tunnel_id,
-                stream_id,
-                target_host,
-                target_port,
-                duration_ms = elapsed_millis(relay_elapsed),
-                bytes_up = stats.client_to_upstream_bytes,
-                bytes_down = stats.upstream_to_client_bytes,
-                mbps = stats.mbps(relay_elapsed),
-                active_streams_on_tunnel = active_streams,
-                "logical TCP stream closed"
-            );
-
-            Ok(stats)
-        }
-        Err(err) => {
-            debug!(
-                tunnel_id,
-                stream_id,
-                target_host,
-                target_port,
-                duration_ms = elapsed_millis(relay_elapsed),
-                active_streams_on_tunnel = active_streams,
-                error = %err,
-                "logical TCP stream closed with relay error"
-            );
-
-            Err(err)
-        }
     }
 }
 
@@ -431,6 +243,5 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
 
 enum TcpOutboundStream {
     Proxy(BoxedIo),
-    MultiplexedProxy(TunnelStreamHandle),
     Direct(TcpStream),
 }

@@ -683,7 +683,7 @@ Server TCP relay работает без `relay_multiplexed_tunnel`, `FrameType:
 
 ---
 
-## Этап 6. Переписать session TCP relay на raw stream
+## ~~Этап 6. Переписать session TCP relay на raw stream~~
 
 Цель: убрать framed relay из обычного SOCKS TCP path.
 
@@ -732,7 +732,7 @@ SOCKS success нужно отправлять только после того, 
 
 ---
 
-## Этап 7. Удалить multiplexing из active code path
+## ~~Этап 7. Удалить multiplexing из active code path~~
 
 Цель: не засорять код неиспользуемым транспортом.
 
@@ -816,7 +816,7 @@ ServerMultiplexConfig
 
 ---
 
-## Этап 8. Удалить custom frame protocol из TCP
+## ~~Этап 8. Удалить custom frame protocol из TCP~~
 
 Цель: `protocol.rs` больше не должен быть основой TCP relay.
 
