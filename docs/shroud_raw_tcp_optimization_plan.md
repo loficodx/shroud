@@ -699,7 +699,11 @@ tokio::spawn(async move {
 
 ---
 
-## 13. Настроить socket options
+## 13. ~~Настроить socket options~~
+
+Status: implemented. `TCP_NODELAY` is enabled on accepted SOCKS/server TCP sockets,
+client raw_tcp endpoint sockets, direct target sockets, and server target sockets. Exotic
+socket options are intentionally not configured before baseline benchmarks.
 
 ### На TCP client/server streams
 
@@ -728,7 +732,12 @@ custom congestion control
 
 ---
 
-## 14. Настроить buffer sizes
+## 14. ~~Настроить buffer sizes~~
+
+Status: implemented. `relay.upload_buffer_size` and `relay.download_buffer_size` are
+available in both client and server configs with 64 KiB defaults and positive-value
+validation. Client-side SOCKS/TUN relay and server-side raw_tcp relay use these values in
+`copy_bidirectional_with_sizes`.
 
 ### MVP defaults
 
@@ -1034,8 +1043,8 @@ relay errors
 ### Этап 4 — raw_tcp performance
 
 - [ ] Закэшировать `TlsConnector`.
-- [ ] Включить `TCP_NODELAY`.
-- [ ] Настроить relay buffer sizes через config.
+- [x] Включить `TCP_NODELAY`.
+- [x] Настроить relay buffer sizes через config.
 - [ ] Убрать лишние аллокации в request/response encode/decode.
 - [ ] Проверить, что datapath после handshake — чистый raw relay.
 

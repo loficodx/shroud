@@ -14,6 +14,7 @@ pub struct ClientConfig {
     pub outbound: OutboundConfig,
     pub auth: ClientAuthConfig,
     pub timeouts: TimeoutsConfig,
+    pub relay: RelayConfig,
     pub limits: LimitsConfig,
     pub routing: RoutingConfig,
     pub dns: ClientDnsConfig,
@@ -75,6 +76,7 @@ impl<'de> Deserialize<'de> for ClientConfig {
         let auth = raw.auth.unwrap_or_default();
 
         let timeouts = raw.timeouts.unwrap_or_default();
+        let relay = raw.relay.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let routing = raw.routing.unwrap_or_default();
         let dns = raw.dns.unwrap_or_default();
@@ -86,6 +88,7 @@ impl<'de> Deserialize<'de> for ClientConfig {
             outbound,
             auth,
             timeouts,
+            relay,
             limits,
             routing,
             dns,
@@ -270,6 +273,23 @@ impl Default for LimitsConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RelayConfig {
+    #[serde(default = "default_relay_buffer_size")]
+    pub upload_buffer_size: usize,
+    #[serde(default = "default_relay_buffer_size")]
+    pub download_buffer_size: usize,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            upload_buffer_size: default_relay_buffer_size(),
+            download_buffer_size: default_relay_buffer_size(),
+        }
+    }
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
@@ -328,6 +348,10 @@ fn default_idle_timeout_sec() -> u64 {
 
 fn default_max_concurrent_connections() -> usize {
     4096
+}
+
+fn default_relay_buffer_size() -> usize {
+    64 * 1024
 }
 
 fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
@@ -447,6 +471,8 @@ pub struct ServerConfig {
     pub tls: ServerTlsConfig,
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
+    #[serde(default)]
+    pub relay: RelayConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -638,6 +664,7 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
     }
     validate_client_auth_config(&mut errors, "auth", &config.auth);
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
+    validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_routing_config_into(&mut errors, "routing.rules", &config.routing);
 
@@ -696,6 +723,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     }
     validate_server_transport_config(&mut errors, "transport", &config.transport);
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
+    validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_server_security_config(&mut errors, "security", &config.security);
 
@@ -743,6 +771,19 @@ fn validate_limits_config(
         errors,
         &format!("{base_path}.max_concurrent_connections"),
         limits.max_concurrent_connections,
+    );
+}
+
+fn validate_relay_config(errors: &mut Vec<ConfigFieldError>, base_path: &str, relay: &RelayConfig) {
+    validate_positive_usize(
+        errors,
+        &format!("{base_path}.upload_buffer_size"),
+        relay.upload_buffer_size,
+    );
+    validate_positive_usize(
+        errors,
+        &format!("{base_path}.download_buffer_size"),
+        relay.download_buffer_size,
     );
 }
 
@@ -1011,6 +1052,8 @@ struct ClientConfigRaw {
     #[serde(default)]
     timeouts: Option<TimeoutsConfig>,
     #[serde(default)]
+    relay: Option<RelayConfig>,
+    #[serde(default)]
     limits: Option<LimitsConfig>,
     #[serde(default)]
     routing: Option<RoutingConfig>,
@@ -1099,6 +1142,8 @@ auth:
         assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
         assert_eq!(cfg.timeouts.target_connect_ms, 10_000);
         assert_eq!(cfg.timeouts.idle_timeout_sec, 300);
+        assert_eq!(cfg.relay.upload_buffer_size, 65_536);
+        assert_eq!(cfg.relay.download_buffer_size, 65_536);
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
     }
 
@@ -1124,6 +1169,27 @@ auth:
         let err = load_client_config_yaml(&raw).expect_err("invalid config");
 
         assert!(err.to_string().contains("timeouts.raw_tcp_handshake_ms"));
+    }
+
+    #[test]
+    fn client_config_accepts_relay_buffer_overrides() {
+        let raw = format!(
+            "{BASE_CLIENT_TRANSPORT_CONFIG}\nrelay:\n  upload_buffer_size: 32768\n  download_buffer_size: 131072\n"
+        );
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(cfg.relay.upload_buffer_size, 32_768);
+        assert_eq!(cfg.relay.download_buffer_size, 131_072);
+    }
+
+    #[test]
+    fn client_config_rejects_zero_relay_buffer() {
+        let raw = format!("{BASE_CLIENT_TRANSPORT_CONFIG}\nrelay:\n  upload_buffer_size: 0\n");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("relay.upload_buffer_size"));
     }
 
     #[test]
@@ -1212,6 +1278,8 @@ clients:
 
         assert_eq!(cfg.transport.modes, vec![TransportMode::RawTcp]);
         assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
+        assert_eq!(cfg.relay.upload_buffer_size, 65_536);
+        assert_eq!(cfg.relay.download_buffer_size, 65_536);
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
         assert!(cfg.security.deny_private_ips);
         assert!(cfg.security.allow_ports.is_empty());
@@ -1254,6 +1322,44 @@ clients:
             err.to_string()
                 .contains("limits.max_concurrent_connections")
         );
+    }
+
+    #[test]
+    fn server_config_accepts_relay_buffer_overrides() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+relay:
+  upload_buffer_size: 16384
+  download_buffer_size: 262144
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert_eq!(cfg.relay.upload_buffer_size, 16_384);
+        assert_eq!(cfg.relay.download_buffer_size, 262_144);
+    }
+
+    #[test]
+    fn server_config_rejects_zero_relay_buffer() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+relay:
+  download_buffer_size: 0
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("relay.download_buffer_size"));
     }
 
     #[test]

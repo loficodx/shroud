@@ -34,8 +34,12 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
-    let raw_tcp_state =
-        RawTcpServerState::with_config(cfg.clients.clone(), cfg.timeouts, cfg.security.clone());
+    let raw_tcp_state = RawTcpServerState::with_relay_config(
+        cfg.clients.clone(),
+        cfg.timeouts,
+        cfg.security.clone(),
+        cfg.relay,
+    );
     let connection_slots = Arc::new(Semaphore::new(cfg.limits.max_concurrent_connections));
     let mut active = JoinSet::new();
     info!(
@@ -793,6 +797,7 @@ mod tests {
             transport: Default::default(),
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),
+            relay: Default::default(),
             limits: Default::default(),
             security: ServerSecurityConfig::default(),
             clients: vec![AuthorizedClient {
@@ -1052,6 +1057,7 @@ mod tests {
             transport: Default::default(),
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),
+            relay: Default::default(),
             limits: Default::default(),
             security: ServerSecurityConfig::default(),
             clients: vec![AuthorizedClient {

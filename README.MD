@@ -199,6 +199,10 @@ timeouts:
   target_connect_ms: 10000
   idle_timeout_sec: 300
 
+relay:
+  upload_buffer_size: 65536
+  download_buffer_size: 65536
+
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
   client_secret: "replace-with-random-secret"
@@ -237,6 +241,9 @@ timeouts:
   raw_tcp_handshake_ms: 5000
   target_connect_ms: 10000
   idle_timeout_sec: 300
+relay:
+  upload_buffer_size: 65536
+  download_buffer_size: 65536
 security:
   deny_private_ips: true
   allow_ports:

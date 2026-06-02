@@ -1,6 +1,6 @@
 use crate::auth::validate_auth_bytes;
 use anyhow::{Context, Result, anyhow};
-use shroud_core::config::{AuthorizedClient, ServerSecurityConfig, TimeoutsConfig};
+use shroud_core::config::{AuthorizedClient, RelayConfig, ServerSecurityConfig, TimeoutsConfig};
 use shroud_core::tcp_handshake::{
     ClientAuthProof, TcpConnectStatus, read_raw_tcp_connect_request, write_raw_tcp_connect_status,
 };
@@ -17,15 +17,13 @@ use tokio::time::timeout;
 use tracing::debug;
 
 const RAW_TCP_ALLOWED_TIMESTAMP_SKEW: Duration = Duration::from_secs(120);
-const RAW_TCP_RELAY_BUFFER_SIZE: usize = 64 * 1024;
-
 #[derive(Debug, Clone)]
 pub struct RawTcpServerState {
     clients: Vec<AuthorizedClient>,
     request_read_timeout: Duration,
     target_connect_timeout: Duration,
     security: ServerSecurityConfig,
-    relay_buffer_size: usize,
+    relay: RelayConfig,
     nonce_cache: Arc<RawTcpNonceCache>,
 }
 
@@ -43,12 +41,21 @@ impl RawTcpServerState {
         timeouts: TimeoutsConfig,
         security: ServerSecurityConfig,
     ) -> Self {
+        Self::with_relay_config(clients, timeouts, security, RelayConfig::default())
+    }
+
+    pub fn with_relay_config(
+        clients: Vec<AuthorizedClient>,
+        timeouts: TimeoutsConfig,
+        security: ServerSecurityConfig,
+        relay: RelayConfig,
+    ) -> Self {
         Self {
             clients,
             request_read_timeout: Duration::from_millis(timeouts.raw_tcp_handshake_ms),
             target_connect_timeout: Duration::from_millis(timeouts.target_connect_ms),
             security,
-            relay_buffer_size: RAW_TCP_RELAY_BUFFER_SIZE,
+            relay,
             nonce_cache: Arc::new(RawTcpNonceCache::new(
                 RAW_TCP_ALLOWED_TIMESTAMP_SKEW.saturating_mul(2),
             )),
@@ -164,12 +171,11 @@ where
 
     let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
     let relay_started = Instant::now();
-    let buffer_size = state.relay_buffer_size.max(1);
     let (bytes_up, bytes_down) = tokio::io::copy_bidirectional_with_sizes(
         &mut inbound,
         &mut target,
-        buffer_size,
-        buffer_size,
+        state.relay.upload_buffer_size,
+        state.relay.download_buffer_size,
     )
     .await
     .context("raw_tcp raw relay failed")?;

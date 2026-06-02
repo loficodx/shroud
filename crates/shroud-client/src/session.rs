@@ -1,7 +1,7 @@
 use crate::routing::Router;
 use crate::transport::{BoxedIo, TcpTransport, TcpTransportMetrics};
 use anyhow::{Context, Result};
-use shroud_core::config::{ClientDnsConfig, RouteAction};
+use shroud_core::config::{ClientDnsConfig, RelayConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,21 +11,26 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 const DIRECT_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const COPY_BUF_SIZE: usize = 32 * 1024;
-
 #[derive(Clone)]
 pub struct SessionCore {
     router: Router,
     tcp_transport: Arc<dyn TcpTransport>,
     dns: ClientDnsConfig,
+    relay: RelayConfig,
 }
 
 impl SessionCore {
-    pub fn new(router: Router, tcp_transport: Arc<dyn TcpTransport>, dns: ClientDnsConfig) -> Self {
+    pub fn new(
+        router: Router,
+        tcp_transport: Arc<dyn TcpTransport>,
+        dns: ClientDnsConfig,
+        relay: RelayConfig,
+    ) -> Self {
         Self {
             router,
             tcp_transport,
             dns,
+            relay,
         }
     }
 
@@ -153,8 +158,8 @@ impl SessionCore {
             tokio::io::copy_bidirectional_with_sizes(
                 client_stream,
                 upstream,
-                COPY_BUF_SIZE,
-                COPY_BUF_SIZE,
+                self.relay.upload_buffer_size,
+                self.relay.download_buffer_size,
             )
             .await
             .context("raw TCP relay failed")?;

@@ -366,6 +366,7 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
             key_path: Some(SERVER_KEY.to_string()),
         },
         timeouts: TimeoutsConfig::default(),
+        relay: Default::default(),
         limits: Default::default(),
         security: ServerSecurityConfig {
             deny_private_ips: false,
@@ -415,7 +416,7 @@ async fn start_socks_client_with_dns(
         auth_config(client_secret),
         TimeoutsConfig::default(),
     )?;
-    let session = SessionCore::new(router, tcp_transport, dns);
+    let session = SessionCore::new(router, tcp_transport, dns, Default::default());
 
     let handle = tokio::spawn(async move {
         let _ = socks5::serve(listen, session, 4096).await;
