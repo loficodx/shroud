@@ -1,36 +1,61 @@
 # Development TLS Certificates
 
-The default local configs expect a local CA plus a server certificate signed by that CA:
+The default local server config expects a local CA plus a server certificate signed by that CA.
+
+Expected files:
 
 - `certs/ca.crt`
-- `certs/localhost.crt`
-- `certs/localhost.key`
+- `certs/ca.key`
+- `certs/server.crt`
+- `certs/server.key`
 
-Generate them with:
+`docker-compose.yml` mounts `./certs` into the container as `/app/certs:ro`, and `configs/server.yaml` reads:
+
+```yaml
+tls:
+  enabled: true
+  cert_path: "certs/server.crt"
+  key_path: "certs/server.key"
+```
+
+## Generate certificates
+
+Use the helper script:
 
 ```bash
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout certs/ca.key \
-  -out certs/ca.crt \
-  -days 365 \
-  -subj "/CN=shroud-dev-ca" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign"
-
-openssl req -newkey rsa:2048 -nodes \
-  -keyout certs/localhost.key \
-  -out certs/localhost.csr \
-  -subj "/CN=localhost"
-
-openssl x509 -req \
-  -in certs/localhost.csr \
-  -CA certs/ca.crt \
-  -CAkey certs/ca.key \
-  -CAcreateserial \
-  -out certs/localhost.crt \
-  -days 365 \
-  -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+chmod +x scripts/generate-certs.sh
+./scripts/generate-certs.sh
 ```
+
+By default, the script generates a local development certificate for `localhost` and `127.0.0.1`.
+
+To generate a certificate for a VPS IP or domain, pass the address as the first argument:
+
+```bash
+./scripts/generate-certs.sh 157.22.231.153
+# or
+./scripts/generate-certs.sh panel.example.com
+```
+
+You can also use environment variables:
+
+```bash
+CERT_ADDRESS=157.22.231.153 ./scripts/generate-certs.sh
+CERT_ADDRESS=panel.example.com ./scripts/generate-certs.sh
+```
+
+If certificates already exist, the script does not overwrite them. To regenerate everything:
+
+```bash
+FORCE=1 ./scripts/generate-certs.sh 157.22.231.153
+```
+
+After generation, start the server:
+
+```bash
+docker compose up --build
+```
+
+The script also prints the server certificate SHA-256 fingerprint in DER format. Use this value on the client side if certificate pinning is enabled.
 
 Do not use these development keys in production.

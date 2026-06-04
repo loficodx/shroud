@@ -1,106 +1,93 @@
 # Shroud
 
-Shroud is an experimental Rust client/server tunneling project.
+Shroud is an experimental Rust client/server TCP tunneling project.
 
-The current implementation provides local client inbounds, an authenticated tunnel transport to a remote server, and server-side TCP/UDP relay to the requested target. The main stable path is **SOCKS5 TCP CONNECT over an HTTP/1.1 Upgrade tunnel**, optionally protected by TLS. SOCKS TCP can run either as one tunnel connection per TCP stream or through an experimental persistent multiplexed tunnel. SOCKS5 `UDP ASSOCIATE` is implemented for proxied UDP datagrams on the non-multiplexed tunnel path.
+The current implementation is centered on **raw TCP CONNECT tunneling**: `shroud-client` accepts local SOCKS5 `CONNECT` traffic or Linux TUN TCP streams, opens a per-connection `raw_tcp` tunnel to `shroud-server`, authenticates the client, asks the server to connect to the requested target, and then relays raw bytes in both directions. TLS can wrap the client/server connection.
 
-The project also contains an early Linux **TUN mode** backed by `netstack-smoltcp`. TUN currently targets controlled beta/smoke-test scenarios and is not yet a full VPN replacement.
+The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer accurate for the refactored code path. `raw_tcp` is the default and only implemented transport mode. `http2` and `http3` are reserved in config/types but rejected as not implemented.
 
-## Current status
+## Current Status
 
 ### Implemented
 
 - Rust workspace with three crates:
-  - `shroud-core` — shared config, auth and frame protocol code;
-  - `shroud-client` — local SOCKS5/TUN client and tunnel outbound;
-  - `shroud-server` — HTTP/TLS listener, auth validation, static fallback and TCP/UDP relay.
-- SOCKS5 inbound:
-  - no-auth SOCKS5 handshake;
-  - `CONNECT` command;
-  - `UDP ASSOCIATE` command;
-  - IPv4, IPv6 and domain targets;
-  - TCP relay;
-  - UDP datagram relay through the tunnel for `proxy` routes;
-  - UDP endpoint validation against the TCP control connection and the client's declared UDP endpoint;
-  - fragmented SOCKS UDP packets are dropped.
-- Tunnel transport:
-  - HTTP/1.1 `Upgrade: shroud-tunnel`;
+  - `shroud-core` - shared config, auth, legacy frame helpers, and `raw_tcp` handshake types;
+  - `shroud-client` - local SOCKS5/TUN client, routing, DNS policy checks, and outbound transport;
+  - `shroud-server` - TLS listener, `raw_tcp` authentication, target ACL checks, TCP relay, and legacy HTTP/static handler code.
+- Client inbounds:
+  - SOCKS5 no-auth handshake;
+  - SOCKS5 `CONNECT` for IPv4, IPv6, and domain targets;
+  - Linux TUN TCP mode backed by `netstack-smoltcp`;
+  - configurable concurrent connection limit with `limits.max_concurrent_connections`.
+- TCP transport:
+  - `transport.mode: raw_tcp`;
   - optional TLS;
-  - custom framed protocol;
-  - max frame payload size: `32 KiB`;
-  - oversized frame rejection before payload allocation;
-  - TCP stream frames;
-  - UDP association and UDP datagram frames.
-- TCP multiplexing:
-  - optional client-side `outbound.multiplex`;
-  - optional server-side `multiplex.enabled`;
-  - configurable dynamic pool of persistent physical tunnels via `outbound.min_tunnels` / `outbound.max_tunnels`;
-  - hard per-tunnel stream limit via `outbound.max_streams_per_tunnel`;
-  - logical TCP streams use odd client-allocated `stream_id` values;
-  - per-stream `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` dispatch;
-  - client waits for server `TcpConnect` success before completing SOCKS `CONNECT`;
-  - server-side stream state tracks client/target close direction and ignores late `TcpData` for closing streams;
-  - separate control/data writer queues prioritize connect, error and keepalive frames while keeping `TcpClose` ordered with stream data;
-  - pressure-aware tunnel selection uses active stream count plus recent writer wait;
-  - client keepalive `Ping` / server `Pong` and reconnect of broken persistent tunnels;
-  - active-stream, target, tunnel, close-reason and writer-queue pressure logging.
+  - one tunnel connection per proxied TCP stream;
+  - binary connect handshake with `SHRD` magic, version, command, auth proof, target host, and target port;
+  - one-byte server status before raw byte relay;
+  - TCP_NODELAY on accepted/client/target sockets;
+  - configurable connect, TLS handshake, raw TCP handshake, target connect, and idle timeout values.
 - Authentication:
-  - `client_id` / `client_secret` based auth header;
-  - timestamp validation;
+  - `client_id` / `client_secret` credentials;
+  - HMAC-based auth proof;
+  - timestamp skew validation;
   - nonce replay protection;
-  - credential generation command.
-- Routing:
-  - `proxy`, `direct`, `block` actions;
+  - credential generation command in both binaries.
+- Routing on the client:
+  - `proxy`, `direct`, and `block` actions;
   - exact domain rules;
   - domain suffix rules;
   - CIDR rules for IP targets;
   - port rules;
   - first matching rule wins.
-- DNS policy checks:
-  - domain targets are preserved for remote resolution when possible;
+- DNS policy checks on the client:
+  - domain targets are preserved for remote resolution when applications use SOCKS hostname mode;
   - IP targets can be warned about or blocked;
   - useful for detecting local DNS resolution / DNS leak risk in SOCKS usage.
-- Server web behavior:
-  - `GET /api/status` health endpoint;
+- Server-side target controls:
+  - optional denial of private, loopback, and link-local target IPs with `security.deny_private_ips`;
+  - optional port allowlist with `security.allow_ports`;
+  - remote DNS lookup on the server for domain targets.
+- Server web code:
+  - `GET /api/status` handler;
   - static fallback from `web_root`;
-  - minimal diagnostic exposure.
-- Server relay:
-  - TCP connect and relay to requested targets;
-  - UDP association bind;
-  - UDP datagram send/receive with source address preserved in response datagrams.
+  - neutral 403/404 responses;
+  - note: with the current valid `transport.modes: [raw_tcp]` server mode, non-`raw_tcp` connections are rejected before the HTTP handler is reached.
 - TUN mode:
   - Linux TUN device creation through `/dev/net/tun`;
   - no packet information header (`IFF_NO_PI`);
-  - interface setup and optional route setup;
+  - interface setup and optional default route setup;
   - TCP packet handling through `netstack-smoltcp`;
   - Fake DNS listener for A records;
   - fake IPv4 mapping from `198.18.0.0/15`;
   - fake IP back-mapping to the original domain for observed TCP connections;
   - Linux namespace smoke test script.
 - Tests:
-  - protocol encode/decode tests;
+  - config validation and compatibility tests;
   - routing unit tests;
-  - config validation tests;
+  - raw TCP handshake tests;
+  - raw TCP client/server transport tests;
   - SOCKS/TLS tunnel integration tests;
-  - SOCKS UDP ASSOCIATE integration test;
-  - server-side UDP relay integration test;
-  - multiplexed tunnel unit tests and an ignored multi-stream socket test;
-  - large payload relay test;
-  - half-close behavior test;
-  - timeout/error-path tests;
+  - curl SOCKS5 hostname smoke test;
+  - large payload and half-close relay tests;
+  - direct/block route tests;
+  - DNS policy test;
+  - rejected SOCKS UDP ASSOCIATE test;
+  - server web handler unit tests;
   - ignored Linux TUN smoke test.
 
-### Not implemented yet
+### Not Implemented Or Not Active
 
+- SOCKS5 `UDP ASSOCIATE` relay. It is parsed, then rejected with `CommandNotSupported`.
 - Direct UDP routing from the SOCKS inbound.
 - TUN UDP forwarding.
-- Browser DoH/DoT interception.
-- Multiplexed UDP associations.
+- TCP multiplexing over one persistent tunnel.
 - Per-stream multiplex flow control.
-- Benchmark-driven multiplex frame-size tuning.
+- Active client HTTP/1.1 Upgrade transport.
 - WebSocket transport.
 - HTTP/2 transport.
-- QUIC / HTTP/3 transport.
+- HTTP/3 / QUIC transport.
+- Browser DoH/DoT interception.
 - Server-side egress IP selection.
 - Automatic system DNS switching for TUN mode.
 
@@ -109,18 +96,17 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 ```text
 Application / curl / browser
         |
-        | SOCKS5 or TUN
+        | SOCKS5 CONNECT or Linux TUN TCP
         v
 shroud-client
         |
-        | HTTP/1.1 Upgrade + Shroud frames
+        | raw_tcp CONNECT handshake
         | optional TLS
-        | optional TCP multiplexing
+        | one tunnel connection per TCP stream
         v
 shroud-server
         |
-        | TCP connect / relay
-        | UDP send / receive
+        | server-side DNS lookup / ACL / TCP connect
         v
 Target host
 ```
@@ -132,6 +118,7 @@ Workspace layout:
 ├── Cargo.toml
 ├── configs/
 │   ├── client.yaml
+│   ├── client-remote.yaml
 │   └── server.yaml
 ├── crates/
 │   ├── shroud-core/
@@ -139,8 +126,10 @@ Workspace layout:
 │   └── shroud-server/
 ├── scripts/
 │   └── tun-smoke-linux.sh
-└── web/
-    └── index.html
+├── web/
+│   └── index.html
+├── Dockerfile
+└── docker-compose.yml
 ```
 
 ## Requirements
@@ -148,6 +137,7 @@ Workspace layout:
 - Rust toolchain compatible with edition `2024`.
 - `cargo`.
 - `curl` for manual smoke checks.
+- Docker / Docker Compose if running the server in a container.
 - Linux for TUN mode.
 - Root privileges for TUN smoke tests.
 - Linux tools for TUN smoke tests:
@@ -156,6 +146,8 @@ Workspace layout:
   - `/dev/net/tun`.
 
 ## Configuration
+
+The current client config shape uses `transport`, not the old `outbound` block. Legacy `outbound` is still accepted for compatibility, but the client logs a deprecation warning. If both `transport` and legacy `outbound` are present, `transport` wins.
 
 Example client config:
 
@@ -171,26 +163,15 @@ inbounds:
     address: "10.10.0.2/24"
     mtu: 1400
     auto_route: false
-    dns: "127.0.0.1"
+    dns: "10.10.0.53"
 
-outbound:
+transport:
+  mode: raw_tcp
   server: "127.0.0.1"
   port: 8443
-  path: "/api/tunnel"
   tls: true
   tls_server_name: "localhost"
   tls_ca_cert_path: "certs/ca.crt"
-  multiplex: true
-  multiplex_tunnels: 4
-  min_tunnels: 4
-  max_tunnels: 12
-  max_streams_per_tunnel: 8
-  stream_slot_wait_timeout_ms: 2000
-  scale_up_writer_wait_ms: 100
-  scale_up_queue_depth_ratio: 0.75
-  scale_down_idle_secs: 60
-  keepalive_interval_secs: 20
-  keepalive_timeout_secs: 10
 
 timeouts:
   server_connect_ms: 10000
@@ -203,8 +184,11 @@ relay:
   upload_buffer_size: 65536
   download_buffer_size: 65536
 
+limits:
+  max_concurrent_connections: 4096
+
 auth:
-  client_id: "11111111-1111-1111-1111-111111111111"
+  client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
   client_secret: "replace-with-random-secret"
 
 dns:
@@ -231,10 +215,13 @@ Example server config:
 listen: "0.0.0.0:8443"
 tunnel_path: "/api/tunnel"
 web_root: "./web"
+transport:
+  modes:
+    - raw_tcp
 tls:
   enabled: true
-  cert_path: "certs/localhost.crt"
-  key_path: "certs/localhost.key"
+  cert_path: "certs/server.crt"
+  key_path: "certs/server.key"
 timeouts:
   server_connect_ms: 10000
   tls_handshake_ms: 10000
@@ -244,23 +231,21 @@ timeouts:
 relay:
   upload_buffer_size: 65536
   download_buffer_size: 65536
+limits:
+  max_concurrent_connections: 4096
 security:
   deny_private_ips: true
-  allow_ports:
-    - 80
-    - 443
+  allow_ports: []
 clients:
-  - client_id: "11111111-1111-1111-1111-111111111111"
+  - client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
     client_secret: "replace-with-random-secret"
-multiplex:
-  enabled: true
 ```
 
-The checked-in example configs expect certificate files under `certs/` relative to the workspace root. If that directory is absent, either create/copy development certificates there or change the paths in `configs/client.yaml` and `configs/server.yaml`.
+`security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
 
-`outbound.multiplex` and `multiplex.enabled` must be configured consistently for the intended tunnel mode. The checked-in configs enable the experimental TCP multiplexed mode.
+The checked-in `configs/server.yaml` expects `certs/server.crt` and `certs/server.key`. The development certificate guide in `certs/README.md` generates `certs/localhost.crt` and `certs/localhost.key`. For local runs, either copy/rename the generated files to the server config paths or update `configs/server.yaml` to use the generated `localhost` certificate paths.
 
-## Generate client credentials
+## Generate Client Credentials
 
 ```bash
 cargo run -p shroud-server -- generate-credentials
@@ -304,9 +289,7 @@ The compose service mounts these host paths read-only into the container:
 - `certs/` -> `/app/certs/`;
 - `web/` -> `/app/web/`.
 
-The default server config uses relative paths under `/app`, so `tls.cert_path: "certs/localhost.crt"`,
-`tls.key_path: "certs/localhost.key"` and `web_root: "./web"` work unchanged in the container.
-Generate or copy the TLS files described in `certs/README.md` before starting the service.
+The container uses `/app` as its working directory, so relative server paths such as `certs/server.crt`, `certs/server.key`, and `./web` resolve under `/app`.
 
 Start the client:
 
@@ -314,34 +297,14 @@ Start the client:
 cargo run -p shroud-client -- configs/client.yaml
 ```
 
-By default, both binaries use the default config path when no config argument is provided:
+Both binaries use default config paths when no config argument is provided:
 
 ```bash
 cargo run -p shroud-server
 cargo run -p shroud-client
 ```
 
-## Health check
-
-For TLS with a development CA:
-
-```bash
-curl --cacert certs/ca.crt https://localhost:8443/api/status
-```
-
-Expected response:
-
-```json
-{"status":"ok"}
-```
-
-For local testing with certificate verification disabled:
-
-```bash
-curl -k https://localhost:8443/api/status
-```
-
-## SOCKS5 smoke test
+## SOCKS5 Smoke Test
 
 Make sure SOCKS is enabled and TUN is disabled in the client config:
 
@@ -360,75 +323,9 @@ Run server and client, then test:
 curl -v --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
-Use `--socks5-hostname`, not `--socks5`, when you want the domain name to be sent through the tunnel and resolved remotely by the server side.
+Use `--socks5-hostname`, not `--socks5`, when you want the domain name to be sent to Shroud and resolved on the server side.
 
-This is the primary MVP scenario.
-
-### SOCKS5 TCP multiplexing
-
-TCP multiplexing is available for SOCKS5 `CONNECT` proxy routes. When enabled, the client opens a pool of persistent physical HTTP Upgrade tunnels and sends logical TCP streams over them using distinct `stream_id` values per tunnel.
-
-Enable it on the client:
-
-```yaml
-outbound:
-  multiplex: true
-  multiplex_tunnels: 4
-  min_tunnels: 4
-  max_tunnels: 12
-  max_streams_per_tunnel: 8
-  stream_slot_wait_timeout_ms: 2000
-  scale_up_writer_wait_ms: 100
-  scale_up_queue_depth_ratio: 0.75
-  scale_down_idle_secs: 60
-  keepalive_interval_secs: 20
-  keepalive_timeout_secs: 10
-```
-
-Enable the matching server relay mode:
-
-```yaml
-multiplex:
-  enabled: true
-```
-
-Current behavior:
-
-- applies to proxied SOCKS TCP connections;
-- uses `outbound.min_tunnels` persistent physical tunnels at startup, defaulting to `outbound.multiplex_tunnels`;
-- grows up to `outbound.max_tunnels` when connected tunnels are full or writer queues look congested;
-- enforces `outbound.max_streams_per_tunnel` as a hard slot limit and waits up to `outbound.stream_slot_wait_timeout_ms` for capacity when the pool cannot grow;
-- chooses a connected tunnel by pressure score: active streams plus recent writer wait;
-- creates logical streams with odd client-side `stream_id` values;
-- dispatches `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` per logical stream;
-- uses separate control/data writer queues so connect/error/keepalive frames are preferred over `TcpData`, with periodic control checks after bounded data bursts;
-- sends client keepalive `Ping` frames and reconnects a broken persistent tunnel while excluding disconnected tunnels from new stream selection;
-- logs active stream counts and writer-channel send waits when the writer queue is under pressure.
-
-Current limitations:
-
-- multiplexed mode is TCP-only for the MVP: SOCKS5 `UDP ASSOCIATE` is rejected with `CommandNotSupported`;
-- no per-stream flow control yet.
-
-Because the server chooses either the multiplexed relay or the non-multiplexed relay for the tunnel path, SOCKS5 `UDP ASSOCIATE` currently requires the non-multiplexed server mode. Disable both `outbound.multiplex` and `multiplex.enabled` when testing UDP ASSOCIATE. Browser QUIC/HTTP/3 traffic is not optimized by the multiplexed MVP; disable HTTP/3 when validating browser/video behavior over TCP.
-
-### SOCKS5 UDP ASSOCIATE
-
-SOCKS5 `UDP ASSOCIATE` is supported for UDP clients that use the SOCKS5 UDP request header format.
-
-Behavior:
-
-- Shroud binds a local UDP socket and returns its address in `BND.ADDR` / `BND.PORT`;
-- the TCP SOCKS control connection stays open for the lifetime of the UDP association;
-- UDP packets are accepted only from the expected client UDP endpoint;
-- SOCKS UDP headers are decoded locally and encoded again for responses;
-- `proxy` routes are sent through the tunnel as `UdpDatagram` frames;
-- `block` routes are dropped;
-- `direct` routes are currently dropped because direct UDP relay is not implemented yet.
-
-This is covered by the `socks_udp_associate_relays_datagrams_through_tunnel` integration test.
-
-## DNS leak notes
+## DNS Leak Notes
 
 For SOCKS usage:
 
@@ -455,9 +352,9 @@ For TUN usage, Fake DNS only works when the system resolver actually sends DNS q
 
 DoH/DoT configured inside a browser is not intercepted by the current Fake DNS listener.
 
-## TUN mode
+## TUN Mode
 
-TUN mode is Linux-only and currently beta-level.
+TUN mode is Linux-only and beta-level.
 
 Enable it in the client config:
 
@@ -476,9 +373,9 @@ inbounds:
 
 With `auto_route: false`, Shroud opens and configures the TUN interface, but system traffic will not automatically use it.
 
-With `auto_route: true`, Shroud attempts to move the default route through the TUN interface and adds loop-protection for the tunnel server endpoint. Use this only in controlled test environments until the TUN mode is more mature.
+With `auto_route: true`, Shroud attempts to move the default route through the TUN interface and adds loop protection for the tunnel server endpoint. Use this only in controlled test environments until TUN mode is more mature.
 
-### Fake DNS with TUN
+### Fake DNS With TUN
 
 Fake DNS is started only when TUN mode is enabled. It listens on UDP port `53` at `inbounds.tun.dns`. If `dns` is omitted, the listener defaults to `127.0.0.1:53`.
 
@@ -520,7 +417,7 @@ nameserver 127.0.0.1
 
 Restore the previous DNS settings after stopping Shroud. Shroud currently does not save, replace, or restore system DNS configuration.
 
-If you configure `inbounds.tun.dns` to a non-loopback address, that address must be local and bindable by the client process before the Fake DNS task starts. For example, using `10.10.0.53` requires you to arrange that address yourself; Shroud does not add it automatically. Binding to an address that is not present on the host can make the Fake DNS listener fail to start.
+If you configure `inbounds.tun.dns` to a non-loopback address, that address must be local and bindable by the client process before the Fake DNS task starts. For example, using `10.10.0.53` requires you to arrange that address yourself; Shroud does not add it automatically.
 
 Current TUN limitations:
 
@@ -531,9 +428,9 @@ Current TUN limitations:
 - browser DoH/DoT bypasses Fake DNS;
 - QUIC/HTTP3 traffic is not supported through TUN yet.
 
-## TUN smoke test
+## TUN Smoke Test
 
-The Linux TUN smoke test creates isolated network namespaces, starts a local server/client pair and verifies that `curl` reaches a target through the TUN path.
+The Linux TUN smoke test creates isolated network namespaces, starts a local server/client pair, and verifies that `curl` reaches a target through the TUN path.
 
 Run:
 
@@ -578,13 +475,50 @@ sudo cargo test -p shroud-client --test tun_smoke_linux -- --ignored
 
 The TUN smoke test is ignored by default because it requires Linux root privileges and modifies network namespaces/routes.
 
-## Protocol summary
+## Protocol Summary
 
-In non-multiplexed mode, each tunnel connection carries either one TCP stream or one UDP association.
+### raw_tcp
 
-In multiplexed mode, each persistent tunnel connection carries multiple logical TCP streams. The client can open a pool of persistent tunnels and schedules new streams across connected tunnels. UDP associations are intentionally rejected in this TCP-only MVP.
+`raw_tcp` is the active client/server transport.
 
-Frame header:
+Connection sequence:
+
+```text
+client TCP connect to server
+optional TLS handshake
+client raw_tcp CONNECT request
+server one-byte status
+raw byte relay between client and target
+```
+
+Client request fields:
+
+```text
+magic:      "SHRD"
+version:    1
+command:    CONNECT = 1
+auth_len:   u8
+auth:       client_id + timestamp + nonce + hmac tag
+host_len:   u8
+host:       UTF-8 target host
+port:       u16 big-endian
+```
+
+Server status values:
+
+```text
+0x00 ok
+0x01 auth_failed
+0x02 invalid_request
+0x03 connect_failed
+0x04 forbidden
+```
+
+Auth proof validation includes the configured client secret, a timestamp skew window, and nonce replay protection.
+
+### Legacy Frame Helper
+
+`shroud-core` still contains a small framed protocol helper with this header shape:
 
 ```text
 version:   u8
@@ -595,87 +529,18 @@ length:    u32
 payload:   [u8; length]
 ```
 
-Important frame types:
-
-- `TcpConnect` — request or acknowledge a target TCP connection;
-- `TcpData` — relay TCP payload;
-- `TcpClose` — half-close / close notification;
-- `UdpAssociateRequest` — request a remote UDP association;
-- `UdpAssociateResponse` — acknowledge the UDP association and return the remote UDP bind address;
-- `UdpDatagram` — relay one UDP datagram with target/source address metadata;
-- `ErrorFrame` — report tunnel or target connection failure;
-- `Ping` / `Pong` — keepalive frames for persistent multiplexed tunnels; the client sends `Ping`, the server responds with `Pong`, and the client reconnects a tunnel when keepalive fails.
-
 Current hard limit:
 
 ```text
 MAX_FRAME_PAYLOAD_LEN = 32 KiB
 ```
 
-## Security notes
+This helper is covered by tests but is not the active data-plane for `raw_tcp` tunneling.
+
+## Security Notes
 
 - Use TLS in production.
-- Use a valid public CA certificate or configure `tls_ca_cert_path` for a private CA.
-- Treat `client_secret` as a password.
-- Do not commit real secrets.
-- Restrict permissions on config files containing secrets.
-- Keep `GET /api/status` minimal; it intentionally does not expose routing, auth or client details.
-- Do not expose tunnel internals through fallback pages or error responses.
-
-## Roadmap
-
-### MVP stabilization
-
-- Keep SOCKS5 TCP CONNECT as the main stable path.
-- Keep non-multiplexed SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
-- Continue stabilizing TCP multiplexing under browser/video workloads:
-  - benchmark `min_tunnels` / `max_tunnels` / `max_streams_per_tunnel` combinations and tune defaults from measured writer waits;
-  - track late/unknown `TcpData` frequency under load;
-  - add per-stream or per-host throughput summaries where useful.
-- Keep HTTP/1.1 Upgrade transport until the TCP MVP is fully stable.
-- Continue hardening timeouts, frame validation and relay edge cases.
-- Keep `cargo test --workspace` as the default quality gate.
-
-### TUN usable beta
-
-- Validate `auto_route` in Linux namespaces.
-- Add startup diagnostics for:
-  - TUN interface name/address;
-  - `auto_route` status;
-  - Fake DNS listen address;
-  - detected system DNS;
-  - DNS leak risk.
-- Decide DNS behavior:
-  - either automatic system DNS switch when `tun.auto_route = true`;
-  - or explicit manual setup documented as the supported beta behavior.
-- Clearly keep TUN marked as TCP-only until UDP forwarding exists.
-
-### Post-MVP
-
-- WebSocket over TLS transport.
-- Direct UDP routing from the SOCKS inbound.
-- TUN UDP forwarding.
-- HTTP/2 transport.
-- QUIC / HTTP/3 transport.
-- Multiplex per-stream flow control and deeper fairness tuning.
-- Multiplexed UDP associations.
-- Egress IP / exit selection.
-- Better operational observability.
-
-## Development notes
-
-Useful commands:
-
-```bash
-cargo fmt
-cargo clippy --workspace --all-targets
-cargo test --workspace
-cargo build -p shroud-client -p shroud-server
-```
-
-For verbose logs:
-
-```bash
-RUST_LOG=debug cargo run -p shroud-client -- configs/client.yaml
-RUST_LOG=debug cargo run -p shroud-server -- configs/server.yaml
-```
+- Use a valid public CA certificate or configure `transport.tls_ca_cert_path` for a private CA.
+- Keep `client_secret` secret; treat it as a password.
+- Do not commit production secrets or private keys.
+- Review `security.deny_private_ips` and `security.allow_ports` before exposing a server to untrusted clients.
