@@ -32,7 +32,7 @@ By default, the script generates a local development certificate for `localhost`
 To generate a certificate for a VPS IP or domain, pass the address as the first argument:
 
 ```bash
-./scripts/generate-certs.sh 157.22.231.153
+./scripts/generate-certs.sh 159.23.231.151
 # or
 ./scripts/generate-certs.sh panel.example.com
 ```
@@ -40,14 +40,14 @@ To generate a certificate for a VPS IP or domain, pass the address as the first 
 You can also use environment variables:
 
 ```bash
-CERT_ADDRESS=157.22.231.153 ./scripts/generate-certs.sh
+CERT_ADDRESS=159.23.231.151 ./scripts/generate-certs.sh
 CERT_ADDRESS=panel.example.com ./scripts/generate-certs.sh
 ```
 
 If certificates already exist, the script does not overwrite them. To regenerate everything:
 
 ```bash
-FORCE=1 ./scripts/generate-certs.sh 157.22.231.153
+FORCE=1 ./scripts/generate-certs.sh 159.23.231.151
 ```
 
 After generation, start the server:
