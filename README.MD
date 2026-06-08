@@ -32,7 +32,7 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
   - HMAC-based auth proof;
   - timestamp skew validation;
   - nonce replay protection;
-  - credential generation command in both binaries.
+  - server setup command that generates/reuses authorized client credentials.
 - Routing on the client:
   - `proxy`, `direct`, and `block` actions;
   - exact domain rules;
@@ -171,7 +171,8 @@ transport:
   port: 8443
   tls: true
   tls_server_name: "localhost"
-  tls_ca_cert_path: "certs/ca.crt"
+  # Replace with the value printed by `shroud-server setup`.
+  tls_server_cert_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 timeouts:
   server_connect_ms: 10000
@@ -243,31 +244,52 @@ clients:
 
 `security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
 
-The checked-in `configs/server.yaml` expects `certs/server.crt` and `certs/server.key`. The development certificate guide in `certs/README.md` generates `certs/localhost.crt` and `certs/localhost.key`. For local runs, either copy/rename the generated files to the server config paths or update `configs/server.yaml` to use the generated `localhost` certificate paths.
+## Server Setup
 
-## Generate Client Credentials
+Recommended setup creates or updates `configs/server.yaml`, creates/reuses `certs/server.crt` and `certs/server.key`, ensures there is an authorized client, and prints a copy-paste client config snippet:
 
 ```bash
-cargo run -p shroud-server -- generate-credentials
+cargo run -p shroud-server -- setup --server 127.0.0.1 --port 8443
 ```
 
-or:
+For a remote host, use the public IP or DNS name clients will connect to:
 
 ```bash
-cargo run -p shroud-client -- generate-credentials
+cargo run -p shroud-server -- setup --server 138.124.55.220 --port 8443
 ```
 
 The command prints:
 
-```yaml
-client_id: "..."
-client_secret: "..."
+```text
+Shroud server setup complete.
+
+Generated or reused:
+  server config: configs/server.yaml
+  server cert:   certs/server.crt
+  server key:    certs/server.key
+
+Use this client config:
+
+transport:
+  mode: raw_tcp
+  server: "138.124.55.220"
+  port: 8443
+  tls: true
+  tls_server_name: "138.124.55.220"
+  tls_server_cert_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+auth:
+  client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
+  client_secret: "replace-with-generated-secret"
 ```
 
-Put the same pair into:
+Put the printed `transport` and `auth` blocks into the client config. The client verifies the exact server certificate with `tls_server_cert_sha256`, so copying a local CA certificate to the client is not required.
 
-- `auth.client_id` / `auth.client_secret` in the client config;
-- `clients[].client_id` / `clients[].client_secret` in the server config.
+Legacy/manual credential generation still exists on the server for development:
+
+```bash
+cargo run -p shroud-server -- generate-credentials
+```
 
 ## Run
 
@@ -540,7 +562,7 @@ This helper is covered by tests but is not the active data-plane for `raw_tcp` t
 ## Security Notes
 
 - Use TLS in production.
-- Use a valid public CA certificate or configure `transport.tls_ca_cert_path` for a private CA.
+- Pin self-signed/private server certificates with `transport.tls_server_cert_sha256`.
 - Keep `client_secret` secret; treat it as a password.
 - Do not commit production secrets or private keys.
 - Review `security.deny_private_ips` and `security.allow_ports` before exposing a server to untrusted clients.

@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use shroud_client::{routing, session, socks5, transport, tun};
-use shroud_core::config::{generate_client_credentials, load_client_config_yaml};
+use shroud_core::config::load_client_config_yaml;
 use std::fs;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -26,9 +26,7 @@ async fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let Some(config_path) = parse_cli()? else {
-        return Ok(());
-    };
+    let config_path = parse_cli()?;
     let raw = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let cfg = load_client_config_yaml(&raw)
@@ -112,20 +110,65 @@ async fn main() -> Result<()> {
     socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
-fn parse_cli() -> Result<Option<String>> {
-    let mut args = std::env::args().skip(1);
+fn parse_cli() -> Result<String> {
+    parse_cli_args(std::env::args().skip(1))
+}
+
+fn parse_cli_args<I, S>(args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter();
     let first = args.next();
+    let first = first.map(Into::into);
     if matches!(
         first.as_deref(),
         Some("generate-credentials") | Some("gen-credentials")
     ) {
-        let credentials = generate_client_credentials();
-        println!("client_id: \"{}\"", credentials.client_id);
-        println!("client_secret: \"{}\"", credentials.client_secret);
-        return Ok(None);
+        bail!(
+            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+        );
     }
 
-    Ok(Some(
-        first.unwrap_or_else(|| "configs/client.yaml".to_string()),
-    ))
+    Ok(first.unwrap_or_else(|| "configs/client.yaml".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cli_args;
+
+    #[test]
+    fn parse_cli_defaults_to_sample_client_config() {
+        let config_path = parse_cli_args(std::iter::empty::<&str>()).expect("parse default config");
+
+        assert_eq!(config_path, "configs/client.yaml");
+    }
+
+    #[test]
+    fn parse_cli_accepts_config_path() {
+        let config_path = parse_cli_args(["custom-client.yaml"]).expect("parse custom config");
+
+        assert_eq!(config_path, "custom-client.yaml");
+    }
+
+    #[test]
+    fn parse_cli_rejects_generate_credentials_command() {
+        let err = parse_cli_args(["generate-credentials"]).expect_err("command must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+        );
+    }
+
+    #[test]
+    fn parse_cli_rejects_gen_credentials_alias() {
+        let err = parse_cli_args(["gen-credentials"]).expect_err("alias must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+        );
+    }
 }

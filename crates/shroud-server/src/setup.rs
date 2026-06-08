@@ -83,26 +83,41 @@ pub fn run_setup(options: SetupOptions) -> Result<SetupOutput> {
 }
 
 pub fn print_client_snippet(output: &SetupOutput) {
-    println!("Shroud server setup complete.");
-    println!();
-    println!("Generated or reused:");
-    println!("  server config: {}", output.config_path.display());
-    println!("  server cert:   {}", output.server_cert_path.display());
-    println!("  server key:    {}", output.server_key_path.display());
-    println!();
-    println!("Use this client config:");
-    println!();
-    println!("transport:");
-    println!("  mode: raw_tcp");
-    println!("  server: \"{}\"", output.server);
-    println!("  port: {}", output.port);
-    println!("  tls: true");
-    println!("  tls_server_name: \"{}\"", output.server);
-    println!("  tls_server_cert_sha256: \"{}\"", output.cert_sha256);
-    println!();
-    println!("auth:");
-    println!("  client_id: \"{}\"", output.client_id);
-    println!("  client_secret: \"{}\"", output.client_secret);
+    print!("{}", render_client_snippet(output));
+}
+
+pub fn render_client_snippet(output: &SetupOutput) -> String {
+    format!(
+        r#"Shroud server setup complete.
+
+Generated or reused:
+  server config: {config_path}
+  server cert:   {server_cert_path}
+  server key:    {server_key_path}
+
+Use this client config:
+
+transport:
+  mode: raw_tcp
+  server: "{server}"
+  port: {port}
+  tls: true
+  tls_server_name: "{server}"
+  tls_server_cert_sha256: "{cert_sha256}"
+
+auth:
+  client_id: "{client_id}"
+  client_secret: "{client_secret}"
+"#,
+        config_path = output.config_path.display(),
+        server_cert_path = output.server_cert_path.display(),
+        server_key_path = output.server_key_path.display(),
+        server = output.server,
+        port = output.port,
+        cert_sha256 = output.cert_sha256,
+        client_id = output.client_id,
+        client_secret = output.client_secret,
+    )
 }
 
 fn read_or_create_server_config(options: &SetupOptions) -> Result<ServerConfig> {
@@ -432,6 +447,124 @@ clients:
         assert_eq!(output.client_secret, "existing-secret");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn setup_preserves_existing_custom_cert_paths_security_timeouts_and_relay() {
+        let dir = unique_temp_dir();
+        let config_path = dir.join("server.yaml");
+        let cert_dir = dir.join("target-certs");
+        let custom_cert_dir = dir.join("custom-certs");
+        let custom_cert_path = custom_cert_dir.join("custom.crt");
+        let custom_key_path = custom_cert_dir.join("custom.key");
+        let cert_path_string = custom_cert_path.to_string_lossy();
+        let key_path_string = custom_key_path.to_string_lossy();
+        fs::create_dir_all(&custom_cert_dir).expect("create custom cert dir");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+listen: "127.0.0.1:9443"
+tunnel_path: "/api/tunnel"
+web_root: "./web"
+transport:
+  modes:
+    - raw_tcp
+tls:
+  enabled: true
+  cert_path: "{cert_path_string}"
+  key_path: "{key_path_string}"
+timeouts:
+  server_connect_ms: 1234
+  tls_handshake_ms: 2345
+  raw_tcp_handshake_ms: 3456
+  target_connect_ms: 4567
+  idle_timeout_sec: 5678
+relay:
+  upload_buffer_size: 1111
+  download_buffer_size: 2222
+limits:
+  max_concurrent_connections: 3333
+security:
+  deny_private_ips: false
+  allow_ports:
+    - 80
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "existing-secret"
+"#
+            ),
+        )
+        .expect("write existing config");
+
+        let output = run_setup(SetupOptions {
+            server: "localhost".to_string(),
+            port: 8443,
+            config_path: config_path.clone(),
+            cert_dir,
+            force_certs: false,
+            force_client: false,
+        })
+        .expect("setup succeeds");
+
+        let raw = fs::read_to_string(&config_path).expect("read updated config");
+        let config: ServerConfig = serde_yaml::from_str(&raw).expect("parse updated config");
+
+        assert_eq!(config.listen.to_string(), "127.0.0.1:8443");
+        assert_eq!(
+            config.tls.cert_path.as_deref(),
+            Some(cert_path_string.as_ref())
+        );
+        assert_eq!(
+            config.tls.key_path.as_deref(),
+            Some(key_path_string.as_ref())
+        );
+        assert_eq!(output.server_cert_path, custom_cert_path);
+        assert_eq!(output.server_key_path, custom_key_path);
+        assert_eq!(config.timeouts.server_connect_ms, 1234);
+        assert_eq!(config.timeouts.tls_handshake_ms, 2345);
+        assert_eq!(config.timeouts.raw_tcp_handshake_ms, 3456);
+        assert_eq!(config.timeouts.target_connect_ms, 4567);
+        assert_eq!(config.timeouts.idle_timeout_sec, 5678);
+        assert_eq!(config.relay.upload_buffer_size, 1111);
+        assert_eq!(config.relay.download_buffer_size, 2222);
+        assert_eq!(config.limits.max_concurrent_connections, 3333);
+        assert!(!config.security.deny_private_ips);
+        assert_eq!(config.security.allow_ports, vec![80]);
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].client_secret, "existing-secret");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn render_client_snippet_is_copy_paste_friendly() {
+        let output = SetupOutput {
+            server: "138.124.55.220".to_string(),
+            port: 8443,
+            config_path: PathBuf::from("configs/server.yaml"),
+            server_cert_path: PathBuf::from("certs/server.crt"),
+            server_key_path: PathBuf::from("certs/server.key"),
+            cert_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7".to_string(),
+            client_secret: "secret".to_string(),
+        };
+
+        let snippet = render_client_snippet(&output);
+
+        assert!(snippet.starts_with("Shroud server setup complete.\n\n"));
+        assert!(snippet.contains("Generated or reused:\n"));
+        assert!(snippet.contains("  server config: configs/server.yaml\n"));
+        assert!(snippet.contains("transport:\n"));
+        assert!(snippet.contains("  server: \"138.124.55.220\"\n"));
+        assert!(snippet.contains("  port: 8443\n"));
+        assert!(snippet.contains(
+            "  tls_server_cert_sha256: \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n"
+        ));
+        assert!(snippet.contains("auth:\n"));
+        assert!(snippet.contains("  client_id: \"c1ce8312-7c35-4e70-867a-3af4ac7f68d7\"\n"));
+        assert!(snippet.ends_with("  client_secret: \"secret\"\n"));
     }
 
     fn unique_temp_dir() -> PathBuf {
