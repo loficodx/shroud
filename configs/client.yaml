@@ -17,7 +17,8 @@ transport:
   port: 8443
   tls: true
   tls_server_name: "localhost"
-  tls_ca_cert_path: "certs/ca.crt"
+  # Replace with SHA-256 of the server certificate DER.
+  tls_server_cert_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 timeouts:
   server_connect_ms: 10000

@@ -27,6 +27,7 @@ const SERVER_KEY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/certs/localhost.key"
 );
+const SERVER_CERT_SHA256: &str = "c2c4a1241508b5b7991d8f2be6ea35f5c8014e56af988b1a16efad05a754dc7b";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -223,6 +224,51 @@ async fn tunnel_rejects_bad_auth() -> TestResult {
     assert!(
         err.to_string().contains("auth_failed"),
         "unexpected bad-auth error: {err:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_tcp_pinned_tls_tunnel_relays_to_target() -> TestResult {
+    let target = start_exact_echo_target(4).await?;
+    let server = start_tunnel_server().await?;
+
+    let mut connected = connect_raw_tcp(
+        &pinned_outbound_config(server.addr, "/api/tunnel", SERVER_CERT_SHA256),
+        &auth_config(CLIENT_SECRET),
+        "127.0.0.1",
+        target.addr.port(),
+    )
+    .await?;
+
+    connected.stream.write_all(b"ping").await?;
+    let mut response = [0u8; 4];
+    connected.stream.read_exact(&mut response).await?;
+
+    assert_eq!(&response, b"ping");
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_tcp_pinned_tls_rejects_cert_pin_mismatch() -> TestResult {
+    let server = start_tunnel_server().await?;
+    let wrong_pin = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    let err = match connect_raw_tcp(
+        &pinned_outbound_config(server.addr, "/api/tunnel", wrong_pin),
+        &auth_config(CLIENT_SECRET),
+        "127.0.0.1",
+        1,
+    )
+    .await
+    {
+        Ok(_) => panic!("raw_tcp unexpectedly accepted wrong server certificate pin"),
+        Err(err) => err,
+    };
+
+    assert!(
+        format!("{err:#}").contains("server certificate sha256 pin mismatch"),
+        "unexpected pin mismatch error: {err:#}"
     );
     Ok(())
 }
@@ -505,7 +551,15 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         tls: true,
         tls_server_name: Some("localhost".to_string()),
         tls_ca_cert_path: Some(CA_CERT.to_string()),
+        tls_server_cert_sha256: None,
     }
+}
+
+fn pinned_outbound_config(server_addr: SocketAddr, path: &str, pin: &str) -> OutboundConfig {
+    let mut outbound = outbound_config(server_addr, path);
+    outbound.tls_ca_cert_path = None;
+    outbound.tls_server_cert_sha256 = Some(pin.to_string());
+    outbound
 }
 
 fn auth_config(client_secret: &str) -> ClientAuthConfig {

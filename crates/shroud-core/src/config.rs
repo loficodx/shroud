@@ -172,6 +172,8 @@ pub struct OutboundConfig {
     pub tls_server_name: Option<String>,
     #[serde(default)]
     pub tls_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub tls_server_cert_sha256: Option<String>,
 }
 
 impl Default for OutboundConfig {
@@ -183,6 +185,7 @@ impl Default for OutboundConfig {
             tls: false,
             tls_server_name: None,
             tls_ca_cert_path: None,
+            tls_server_cert_sha256: None,
         }
     }
 }
@@ -199,6 +202,7 @@ impl OutboundConfig {
             tls: transport.tls,
             tls_server_name: transport.tls_server_name.clone(),
             tls_ca_cert_path: transport.tls_ca_cert_path.clone(),
+            tls_server_cert_sha256: transport.tls_server_cert_sha256.clone(),
         }
     }
 }
@@ -229,6 +233,8 @@ pub struct TransportConfig {
     pub tls_server_name: Option<String>,
     #[serde(default)]
     pub tls_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub tls_server_cert_sha256: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -299,6 +305,7 @@ impl Default for TransportConfig {
             tls: true,
             tls_server_name: None,
             tls_ca_cert_path: None,
+            tls_server_cert_sha256: None,
             path: None,
         }
     }
@@ -313,6 +320,7 @@ impl TransportConfig {
             tls: outbound.tls,
             tls_server_name: outbound.tls_server_name.clone(),
             tls_ca_cert_path: outbound.tls_ca_cert_path.clone(),
+            tls_server_cert_sha256: outbound.tls_server_cert_sha256.clone(),
             path: (!outbound.path.is_empty()).then(|| outbound.path.clone()),
         }
     }
@@ -828,6 +836,28 @@ fn validate_transport_config(
                 validate_file_path(errors, &format!("{base_path}.tls_ca_cert_path"), path);
             }
         }
+        if transport.tls_ca_cert_path.is_some() && transport.tls_server_cert_sha256.is_some() {
+            errors.push(ConfigFieldError::new(
+                format!("{base_path}.tls_server_cert_sha256"),
+                "must not be used together with tls_ca_cert_path",
+            ));
+        }
+        if let Some(pin) = &transport.tls_server_cert_sha256 {
+            validate_sha256_hex(errors, &format!("{base_path}.tls_server_cert_sha256"), pin);
+        }
+    } else {
+        if transport.tls_ca_cert_path.is_some() {
+            errors.push(ConfigFieldError::new(
+                format!("{base_path}.tls_ca_cert_path"),
+                "requires tls=true",
+            ));
+        }
+        if transport.tls_server_cert_sha256.is_some() {
+            errors.push(ConfigFieldError::new(
+                format!("{base_path}.tls_server_cert_sha256"),
+                "requires tls=true",
+            ));
+        }
     }
 }
 
@@ -900,6 +930,28 @@ fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &Outbo
             } else {
                 validate_file_path(errors, "outbound.tls_ca_cert_path", path);
             }
+        }
+        if outbound.tls_ca_cert_path.is_some() && outbound.tls_server_cert_sha256.is_some() {
+            errors.push(ConfigFieldError::new(
+                "outbound.tls_server_cert_sha256",
+                "must not be used together with outbound.tls_ca_cert_path",
+            ));
+        }
+        if let Some(pin) = &outbound.tls_server_cert_sha256 {
+            validate_sha256_hex(errors, "outbound.tls_server_cert_sha256", pin);
+        }
+    } else {
+        if outbound.tls_ca_cert_path.is_some() {
+            errors.push(ConfigFieldError::new(
+                "outbound.tls_ca_cert_path",
+                "requires tls=true",
+            ));
+        }
+        if outbound.tls_server_cert_sha256.is_some() {
+            errors.push(ConfigFieldError::new(
+                "outbound.tls_server_cert_sha256",
+                "requires tls=true",
+            ));
         }
     }
 }
@@ -1002,6 +1054,25 @@ fn validate_file_path(errors: &mut Vec<ConfigFieldError>, path: &str, value: &st
     }
 }
 
+fn validate_sha256_hex(errors: &mut Vec<ConfigFieldError>, field: &str, value: &str) {
+    let trimmed = value.trim();
+
+    if trimmed.len() != 64 {
+        errors.push(ConfigFieldError::new(
+            field,
+            "must be a 64-character lowercase or uppercase hex SHA-256 value",
+        ));
+        return;
+    }
+
+    if !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        errors.push(ConfigFieldError::new(
+            field,
+            "must contain only hexadecimal characters",
+        ));
+    }
+}
+
 fn validate_non_empty(errors: &mut Vec<ConfigFieldError>, path: &str, value: &str) {
     if value.trim().is_empty() {
         errors.push(ConfigFieldError::new(path, "must not be empty"));
@@ -1097,6 +1168,8 @@ struct ClientOutboundsRaw {
 mod tests {
     use super::*;
 
+    const VALID_PIN: &str = "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
+
     const BASE_CLIENT_CONFIG: &str = r#"
 inbound:
   listen: "127.0.0.1:1080"
@@ -1123,6 +1196,27 @@ auth:
   client_secret: "secret"
 "#;
 
+    fn client_transport_config_with_tls(tls: bool, extra_transport: &str) -> String {
+        format!(
+            r#"
+inbound:
+  listen: "127.0.0.1:1080"
+transport:
+  mode: raw_tcp
+  server: "127.0.0.1"
+  port: 8443
+  tls: {tls}
+{extra_transport}auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "secret"
+"#
+        )
+    }
+
+    fn client_transport_config_with(extra_transport: &str) -> String {
+        client_transport_config_with_tls(true, extra_transport)
+    }
+
     #[test]
     fn client_config_accepts_raw_tcp_transport_shape() {
         let cfg = load_client_config_yaml(BASE_CLIENT_TRANSPORT_CONFIG).expect("valid config");
@@ -1145,6 +1239,96 @@ auth:
         assert_eq!(cfg.relay.upload_buffer_size, 65_536);
         assert_eq!(cfg.relay.download_buffer_size, 65_536);
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
+    }
+
+    #[test]
+    fn client_config_accepts_transport_cert_sha256_pin() {
+        let raw =
+            client_transport_config_with(&format!("  tls_server_cert_sha256: \"{VALID_PIN}\"\n"));
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(
+            cfg.transport.tls_server_cert_sha256.as_deref(),
+            Some(VALID_PIN)
+        );
+        assert_eq!(
+            cfg.outbound.tls_server_cert_sha256.as_deref(),
+            Some(VALID_PIN)
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_short_transport_cert_sha256_pin() {
+        let raw = client_transport_config_with("  tls_server_cert_sha256: \"abc\"\n");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.tls_server_cert_sha256"));
+        assert!(err.to_string().contains("64-character"));
+    }
+
+    #[test]
+    fn client_config_rejects_long_transport_cert_sha256_pin() {
+        let raw =
+            client_transport_config_with(&format!("  tls_server_cert_sha256: \"{VALID_PIN}00\"\n"));
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.tls_server_cert_sha256"));
+        assert!(err.to_string().contains("64-character"));
+    }
+
+    #[test]
+    fn client_config_rejects_non_hex_transport_cert_sha256_pin() {
+        let raw = client_transport_config_with(
+            "  tls_server_cert_sha256: \"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"\n",
+        );
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.tls_server_cert_sha256"));
+        assert!(err.to_string().contains("hexadecimal"));
+    }
+
+    #[test]
+    fn client_config_rejects_transport_ca_and_cert_pin_together() {
+        let raw = client_transport_config_with(&format!(
+            "  tls_ca_cert_path: \"Cargo.toml\"\n  tls_server_cert_sha256: \"{VALID_PIN}\"\n"
+        ));
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.tls_server_cert_sha256"));
+        assert!(err.to_string().contains("must not be used together"));
+    }
+
+    #[test]
+    fn client_config_rejects_transport_cert_pin_when_tls_disabled() {
+        let raw = client_transport_config_with_tls(
+            false,
+            &format!("  tls_server_cert_sha256: \"{VALID_PIN}\"\n"),
+        );
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.tls_server_cert_sha256"));
+        assert!(err.to_string().contains("requires tls=true"));
+    }
+
+    #[test]
+    fn client_config_maps_legacy_outbound_cert_pin_to_transport() {
+        let raw = BASE_CLIENT_CONFIG.replace(
+            "  tls: true",
+            &format!("  tls: true\n  tls_server_cert_sha256: \"{VALID_PIN}\""),
+        );
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(
+            cfg.transport.tls_server_cert_sha256.as_deref(),
+            Some(VALID_PIN)
+        );
     }
 
     #[test]
