@@ -120,11 +120,14 @@ Workspace layout:
 │   ├── client.yaml
 │   ├── client-remote.yaml
 │   └── server.yaml
+├── certs/
+│   └── README.md
 ├── crates/
 │   ├── shroud-core/
 │   ├── shroud-client/
 │   └── shroud-server/
 ├── scripts/
+│   ├── generate-certs.sh
 │   └── tun-smoke-linux.sh
 ├── web/
 │   └── index.html
@@ -255,8 +258,29 @@ cargo run -p shroud-server -- setup --server 127.0.0.1 --port 8443
 For a remote host, use the public IP or DNS name clients will connect to:
 
 ```bash
-cargo run -p shroud-server -- setup --server 138.124.55.220 --port 8443
+cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443
 ```
+
+`setup` generates a self-signed server certificate directly. It does not create or require a local CA. The generated certificate always includes `localhost` and `127.0.0.1` as subject alternative names; when `--server` is another IP or DNS name, that value is added too.
+
+Useful setup options:
+
+```bash
+cargo run -p shroud-server -- setup --help
+cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443 --config configs/server.yaml --cert-dir certs
+cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443 --force-certs
+cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443 --force-client
+```
+
+Behavior:
+
+- `--config` selects the server config path; default is `configs/server.yaml`.
+- `--cert-dir` selects where `server.crt` and `server.key` are generated; default is `certs`.
+- existing non-empty `tls.cert_path` and `tls.key_path` in the server config are preserved unless `--force-certs` is used.
+- existing certificate/key files are reused unless `--force-certs` is used.
+- the first existing authorized client is reused unless `--force-client` is used.
+- `--force-client` replaces the configured client list with one newly generated client.
+- the private key is written with `0600` permissions on Unix.
 
 The command prints:
 
@@ -272,10 +296,10 @@ Use this client config:
 
 transport:
   mode: raw_tcp
-  server: "138.124.55.220"
+  server: "159.23.231.151"
   port: 8443
   tls: true
-  tls_server_name: "138.124.55.220"
+  tls_server_name: "159.23.231.151"
   tls_server_cert_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 auth:
@@ -284,6 +308,8 @@ auth:
 ```
 
 Put the printed `transport` and `auth` blocks into the client config. The client verifies the exact server certificate with `tls_server_cert_sha256`, so copying a local CA certificate to the client is not required.
+
+The old `scripts/generate-certs.sh` helper is still present for manual development workflows that need a local CA and an OpenSSL-generated server certificate. It is not required for the recommended `setup` workflow.
 
 Legacy/manual credential generation still exists on the server for development:
 
