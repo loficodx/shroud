@@ -27,7 +27,7 @@ cargo run -p shroud-server -- setup --server 127.0.0.1 --port 8443
 For a VPS IP or DNS name:
 
 ```bash
-cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443
+cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443
 cargo run -p shroud-server -- setup --server panel.example.com --port 8443
 ```
 
@@ -36,7 +36,7 @@ The generated certificate includes `localhost` and `127.0.0.1`. If `--server` is
 By default, setup reuses existing certificate files and existing configured client credentials. To regenerate the certificate/key pair:
 
 ```bash
-cargo run -p shroud-server -- setup --server 159.23.231.151 --port 8443 --force-certs
+cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --force-certs
 ```
 
 The command prints a client config snippet. Copy the printed `transport` and `auth` blocks into the client config. A local CA certificate is not required when using the printed `tls_server_cert_sha256` pin.
@@ -47,7 +47,7 @@ The command prints a client config snippet. Copy the printed `transport` and `au
 
 ```bash
 ./scripts/generate-certs.sh
-./scripts/generate-certs.sh 159.23.231.151
+./scripts/generate-certs.sh 104.20.23.154
 CERT_ADDRESS=panel.example.com FORCE=1 ./scripts/generate-certs.sh
 ```
 
