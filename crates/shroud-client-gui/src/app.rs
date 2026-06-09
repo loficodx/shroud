@@ -332,23 +332,43 @@ impl eframe::App for ShroudGuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Shroud Client");
             ui.separator();
+
             ui.label("Client config YAML");
-            ui.add(
-                egui::TextEdit::multiline(&mut self.editor_text)
-                    .desired_rows(22)
-                    .code_editor()
-                    .lock_focus(true),
-            );
+
+            egui::ScrollArea::vertical()
+                .id_source("config_editor_scroll")
+                .auto_shrink([false, false])
+                .max_height(ui.available_height() * 0.65)
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 420.0],
+                        egui::TextEdit::multiline(&mut self.editor_text)
+                            .desired_rows(22)
+                            .code_editor()
+                            .lock_focus(true),
+                    );
+                });
 
             ui.separator();
+
             ui.label("Client logs");
-            let mut log_text = self.logs.text();
-            ui.add(
-                egui::TextEdit::multiline(&mut log_text)
-                    .desired_rows(8)
-                    .code_editor()
-                    .interactive(false),
-            );
+
+            let log_text = self.logs.text();
+
+            egui::ScrollArea::vertical()
+                .id_source("client_logs_scroll")
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(log_text)
+                                .monospace()
+                        )
+                            .selectable(true),
+                    );
+                });
         });
     }
 }

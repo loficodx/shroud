@@ -153,7 +153,7 @@ fn build_client_command(config_path: &Path) -> ClientCommand {
             OsString::from("--config"),
             config_path.as_os_str().to_os_string(),
             OsString::from("--log-format"),
-            OsString::from("plain"),
+            OsString::from("json"),
         ],
     }
 }
