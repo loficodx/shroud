@@ -40,6 +40,7 @@ impl ClientProcessState {
 pub struct ClientProcess {
     child: Option<Child>,
     state: ClientProcessState,
+    config_path: Option<PathBuf>,
 }
 
 impl ClientProcess {
@@ -54,6 +55,18 @@ impl ClientProcess {
     pub fn state(&mut self) -> ClientProcessState {
         self.refresh_state();
         self.state.clone()
+    }
+
+    pub fn running_config_path(&mut self) -> Option<PathBuf> {
+        self.refresh_state();
+        if matches!(
+            self.state,
+            ClientProcessState::Starting | ClientProcessState::Running
+        ) {
+            self.config_path.clone()
+        } else {
+            None
+        }
     }
 
     fn refresh_state(&mut self) {
@@ -75,6 +88,7 @@ impl ClientProcess {
 
         if let Some(state) = next_state {
             self.child = None;
+            self.config_path = None;
             self.state = state;
         }
     }
@@ -85,11 +99,13 @@ impl ClientProcess {
         }
 
         self.state = ClientProcessState::Starting;
+        self.config_path = None;
         let command = build_client_command(config_path);
         let mut child = spawn_client_command(&command).map_err(|err| {
             self.state = ClientProcessState::Failed {
                 error: err.to_string(),
             };
+            self.config_path = None;
             err
         })?;
 
@@ -107,6 +123,7 @@ impl ClientProcess {
         }
 
         self.child = Some(child);
+        self.config_path = Some(config_path.to_path_buf());
         self.state = ClientProcessState::Running;
         Ok(())
     }
@@ -114,6 +131,7 @@ impl ClientProcess {
     pub fn stop(&mut self) -> Result<()> {
         let Some(mut child) = self.child.take() else {
             self.state = ClientProcessState::Stopped;
+            self.config_path = None;
             return Ok(());
         };
 
@@ -122,18 +140,21 @@ impl ClientProcess {
                 self.state = ClientProcessState::Exited {
                     code: status.code(),
                 };
+                self.config_path = None;
                 Ok(())
             }
             Ok(None) => {
                 child.kill().context("failed to stop shroud-client")?;
                 let _ = child.wait();
                 self.state = ClientProcessState::Stopped;
+                self.config_path = None;
                 Ok(())
             }
             Err(err) => {
                 self.state = ClientProcessState::Failed {
                     error: format!("failed to read client process status: {err}"),
                 };
+                self.config_path = None;
                 Err(err).context("failed to read client process status")
             }
         }
@@ -225,7 +246,8 @@ impl Drop for ClientProcess {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientProcessState, build_client_command, client_binary_name, sibling_client_binary,
+        ClientProcess, ClientProcessState, build_client_command, client_binary_name,
+        sibling_client_binary,
     };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -272,5 +294,21 @@ mod tests {
                 OsString::from("json")
             ]
         );
+    }
+
+    #[test]
+    fn running_config_path_is_available_only_for_active_process_states() {
+        let path = PathBuf::from("configs/client.yaml");
+        let mut process = ClientProcess {
+            child: None,
+            state: ClientProcessState::Running,
+            config_path: Some(path.clone()),
+        };
+
+        assert_eq!(process.running_config_path(), Some(path));
+
+        process.state = ClientProcessState::Stopped;
+
+        assert_eq!(process.running_config_path(), None);
     }
 }

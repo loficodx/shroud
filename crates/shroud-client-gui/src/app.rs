@@ -251,7 +251,13 @@ impl ShroudGuiApp {
         }
     }
 
-    fn show_config_row(&mut self, ui: &mut egui::Ui, index: usize, is_running: bool) {
+    fn show_config_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        is_running: bool,
+        running_config_path: Option<&Path>,
+    ) {
         let Some(config) = self.configs.get(index) else {
             return;
         };
@@ -260,6 +266,9 @@ impl ShroudGuiApp {
         let is_expanded = self.expanded_config == Some(index);
         let is_selected = self.selected_config == Some(index);
         let is_valid = config.is_valid;
+        let is_running_config = running_config_path
+            .map(|path| path == config.path.as_path())
+            .unwrap_or(false);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -285,13 +294,13 @@ impl ShroudGuiApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if is_running {
+                    if is_running_config {
                         if ui.button("Stop").clicked() {
                             self.stop_client();
                         }
                     } else if ui
                         .add_enabled(
-                            self.expanded_config.is_none() && is_valid,
+                            !is_running && self.expanded_config.is_none() && is_valid,
                             egui::Button::new("Start"),
                         )
                         .clicked()
@@ -339,6 +348,7 @@ impl eframe::App for ShroudGuiApp {
         let drained_logs = self.logs.drain();
         let is_running = self.client_process.is_running();
         let process_state = self.client_process.state();
+        let running_config_path = self.client_process.running_config_path();
         if is_running {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -385,7 +395,7 @@ impl eframe::App for ShroudGuiApp {
                 .max_height(ui.available_height() * 0.65)
                 .show(ui, |ui| {
                     for index in 0..self.configs.len() {
-                        self.show_config_row(ui, index, is_running);
+                        self.show_config_row(ui, index, is_running, running_config_path.as_deref());
                         ui.add_space(6.0);
                     }
                 });
@@ -415,6 +425,7 @@ fn config_summary(config: &ClientConfigFile) -> String {
     let address = yaml_value_by_paths(
         &config.raw_yaml,
         &[
+            &["transport", "server"],
             &["server", "host"],
             &["server", "address"],
             &["server_addr"],
@@ -427,6 +438,7 @@ fn config_summary(config: &ClientConfigFile) -> String {
     let port = yaml_value_by_paths(
         &config.raw_yaml,
         &[
+            &["transport", "port"],
             &["server", "port"],
             &["port"],
             &["endpoint", "port"],
@@ -499,5 +511,77 @@ fn discovered_configs_status(configs: &[ClientConfigFile]) -> String {
             configs.len(),
             invalid_count
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_config_file(raw_yaml: &str, is_valid: bool) -> ClientConfigFile {
+        ClientConfigFile {
+            path: PathBuf::from("client-laptop.yaml"),
+            display_name: "client-laptop.yaml".to_string(),
+            raw_yaml: raw_yaml.to_string(),
+            is_valid,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn config_summary_reads_transport_server_port_and_mode() {
+        let config = client_config_file(
+            r#"
+transport:
+  mode: raw_tcp
+  server: 104.20.23.154
+  port: 8443
+"#,
+            true,
+        );
+
+        assert_eq!(
+            config_summary(&config),
+            "client-laptop.yaml - 104.20.23.154 - 8443 - raw_tcp"
+        );
+    }
+
+    #[test]
+    fn config_summary_marks_invalid_configs() {
+        let config = client_config_file(
+            r#"
+transport:
+  mode: h2
+  server: 1.2.3.4
+  port: 8443
+"#,
+            false,
+        );
+
+        assert_eq!(
+            config_summary(&config),
+            "client-laptop.yaml (invalid) - 1.2.3.4 - 8443 - h2"
+        );
+    }
+
+    #[test]
+    fn refresh_configs_with_selection_clears_expanded_config() {
+        let mut app = ShroudGuiApp {
+            config_store: ConfigStore::default(),
+            configs: Vec::new(),
+            selected_config: None,
+            expanded_config: Some(0),
+            editor_text: "unsaved: true".to_string(),
+            import_dialog_open: false,
+            import_text: String::new(),
+            pending_import_path: String::new(),
+            status: String::new(),
+            logs: LogBuffer::default(),
+            client_process: ClientProcess::default(),
+        };
+
+        app.refresh_configs_with_selection(None);
+
+        assert_eq!(app.expanded_config, None);
     }
 }
