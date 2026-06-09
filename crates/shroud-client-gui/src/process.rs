@@ -269,7 +269,7 @@ mod tests {
                 OsString::from("--config"),
                 OsString::from("configs/client.yaml"),
                 OsString::from("--log-format"),
-                OsString::from("plain")
+                OsString::from("json")
             ]
         );
     }

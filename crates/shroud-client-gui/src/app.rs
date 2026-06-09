@@ -10,6 +10,7 @@ pub struct ShroudGuiApp {
     config_store: ConfigStore,
     configs: Vec<ClientConfigFile>,
     selected_config: Option<usize>,
+    expanded_config: Option<usize>,
     editor_text: String,
     import_dialog_open: bool,
     import_text: String,
@@ -34,6 +35,7 @@ impl ShroudGuiApp {
             config_store,
             configs,
             selected_config: None,
+            expanded_config: None,
             editor_text: String::new(),
             import_dialog_open: false,
             import_text: String::new(),
@@ -55,6 +57,7 @@ impl ShroudGuiApp {
                 self.configs = configs;
                 self.selected_config = selected_path
                     .and_then(|path| self.configs.iter().position(|config| &config.path == path));
+                self.expanded_config = None;
 
                 if let Some(index) = self.selected_config {
                     if let Some(config) = self.configs.get(index) {
@@ -76,11 +79,10 @@ impl ShroudGuiApp {
             .map(|config| config.path.clone())
     }
 
-    fn selected_config_label(&self) -> String {
-        self.selected_config
+    fn editing_config_path(&self) -> Option<PathBuf> {
+        self.expanded_config
             .and_then(|index| self.configs.get(index))
-            .map(config_label)
-            .unwrap_or_else(|| "Select client config".to_string())
+            .map(|config| config.path.clone())
     }
 
     fn select_config(&mut self, index: usize) {
@@ -104,15 +106,16 @@ impl ShroudGuiApp {
         };
     }
 
-    fn save_selected_config(&mut self) {
-        let Some(path) = self.selected_config_path() else {
-            self.status = "select a client config before saving".to_string();
+    fn save_editing_config(&mut self) {
+        let Some(path) = self.editing_config_path() else {
+            self.status = "open a config before saving".to_string();
             return;
         };
 
         match self.config_store.save(&path, &self.editor_text) {
             Ok(()) => {
                 self.refresh_configs_with_selection(Some(&path));
+                self.expanded_config = None;
                 self.status = format!("saved {}", path.display());
             }
             Err(err) => self.status = err.to_string(),
@@ -120,6 +123,11 @@ impl ShroudGuiApp {
     }
 
     fn validate_editor(&mut self) {
+        if self.editing_config_path().is_none() {
+            self.status = "open a config before validating".to_string();
+            return;
+        }
+
         match self.config_store.validate(&self.editor_text) {
             Ok(()) => self.status = "config is valid".to_string(),
             Err(err) => self.status = err.to_string(),
@@ -207,11 +215,24 @@ impl ShroudGuiApp {
         self.import_dialog_open = open;
     }
 
-    fn start_client(&mut self) {
-        let Some(path) = self.selected_config_path() else {
-            self.status = "select a saved client config before starting".to_string();
+    fn start_client_config(&mut self, index: usize) {
+        if self.expanded_config.is_some() {
+            self.status = "collapse the open config before starting".to_string();
+            return;
+        }
+
+        let Some(config) = self.configs.get(index) else {
+            self.status = "config not found".to_string();
             return;
         };
+
+        if !config.is_valid {
+            self.status = format!("cannot start invalid config {}", config.path.display());
+            return;
+        }
+
+        let path = config.path.clone();
+        self.select_config(index);
 
         match self.client_process.start(&path, self.logs.sender()) {
             Ok(()) => {
@@ -229,6 +250,88 @@ impl ShroudGuiApp {
             Err(err) => self.status = err.to_string(),
         }
     }
+
+    fn show_config_row(&mut self, ui: &mut egui::Ui, index: usize, is_running: bool) {
+        let Some(config) = self.configs.get(index) else {
+            return;
+        };
+
+        let summary = config_summary(config);
+        let is_expanded = self.expanded_config == Some(index);
+        let is_selected = self.selected_config == Some(index);
+        let is_valid = config.is_valid;
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let arrow = if is_expanded { "v" } else { ">" };
+
+                if ui.button(arrow).clicked() {
+                    if is_expanded {
+                        self.expanded_config = None;
+                    } else {
+                        self.select_config(index);
+                        self.expanded_config = Some(index);
+                    }
+                }
+
+                let label_response = ui.selectable_label(is_selected, summary);
+                if label_response.clicked() {
+                    if is_expanded {
+                        self.expanded_config = None;
+                    } else {
+                        self.select_config(index);
+                        self.expanded_config = Some(index);
+                    }
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_running {
+                        if ui.button("Stop").clicked() {
+                            self.stop_client();
+                        }
+                    } else if ui
+                        .add_enabled(
+                            self.expanded_config.is_none() && is_valid,
+                            egui::Button::new("Start"),
+                        )
+                        .clicked()
+                    {
+                        self.start_client_config(index);
+                    }
+                });
+            });
+
+            if is_expanded {
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if ui.button("Validate").clicked() {
+                        self.validate_editor();
+                    }
+
+                    if ui.button("Save").clicked() {
+                        self.save_editing_config();
+                    }
+
+                    if ui.button("Cancel editing").clicked() {
+                        self.expanded_config = None;
+                        if let Some(config) = self.configs.get(index) {
+                            self.editor_text = config.raw_yaml.clone();
+                        }
+                        self.status = "editing cancelled".to_string();
+                    }
+                });
+
+                ui.add_sized(
+                    [ui.available_width(), 360.0],
+                    egui::TextEdit::multiline(&mut self.editor_text)
+                        .desired_rows(20)
+                        .code_editor()
+                        .lock_focus(true),
+                );
+            }
+        });
+    }
 }
 
 impl eframe::App for ShroudGuiApp {
@@ -245,24 +348,6 @@ impl eframe::App for ShroudGuiApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Config:");
-                egui::ComboBox::from_id_source("config_selector")
-                    .selected_text(self.selected_config_label())
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        if self.configs.is_empty() {
-                            ui.label("No client*.yaml files found.");
-                        }
-
-                        for index in 0..self.configs.len() {
-                            let selected = self.selected_config == Some(index);
-                            let label = config_label(&self.configs[index]);
-                            if ui.selectable_label(selected, label).clicked() {
-                                self.select_config(index);
-                            }
-                        }
-                    });
-
                 if ui.button("Refresh").clicked() {
                     self.refresh_configs();
                 }
@@ -270,55 +355,10 @@ impl eframe::App for ShroudGuiApp {
                 if ui.button("Import Connection").clicked() {
                     self.import_dialog_open = true;
                 }
-
-                if ui
-                    .add_enabled(self.selected_config.is_some(), egui::Button::new("Save"))
-                    .clicked()
-                {
-                    self.save_selected_config();
-                }
-
-                if ui.button("Validate").clicked() {
-                    self.validate_editor();
-                }
-
-                if ui
-                    .add_enabled(!is_running, egui::Button::new("Start"))
-                    .clicked()
-                {
-                    self.start_client();
-                }
-
-                if ui
-                    .add_enabled(is_running, egui::Button::new("Stop"))
-                    .clicked()
-                {
-                    self.stop_client();
-                }
             });
         });
 
         self.show_import_dialog(ctx);
-
-        egui::SidePanel::left("configs")
-            .resizable(true)
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                ui.heading("Configs");
-                ui.separator();
-
-                for index in 0..self.configs.len() {
-                    let selected = self.selected_config == Some(index);
-                    let label = config_label(&self.configs[index]);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.select_config(index);
-                    }
-                }
-
-                if self.configs.is_empty() {
-                    ui.label("No client*.yaml files found.");
-                }
-            });
 
         egui::TopBottomPanel::bottom("status")
             .resizable(false)
@@ -333,25 +373,26 @@ impl eframe::App for ShroudGuiApp {
             ui.heading("Shroud Client");
             ui.separator();
 
-            ui.label("Client config YAML");
+            ui.heading("Configs");
+
+            if self.configs.is_empty() {
+                ui.label("No client*.yaml files found.");
+            }
 
             egui::ScrollArea::vertical()
-                .id_source("config_editor_scroll")
+                .id_source("configs_main_scroll")
                 .auto_shrink([false, false])
                 .max_height(ui.available_height() * 0.65)
                 .show(ui, |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), 420.0],
-                        egui::TextEdit::multiline(&mut self.editor_text)
-                            .desired_rows(22)
-                            .code_editor()
-                            .lock_focus(true),
-                    );
+                    for index in 0..self.configs.len() {
+                        self.show_config_row(ui, index, is_running);
+                        ui.add_space(6.0);
+                    }
                 });
 
             ui.separator();
 
-            ui.label("Client logs");
+            ui.heading("Client logs");
 
             let log_text = self.logs.text();
 
@@ -362,10 +403,7 @@ impl eframe::App for ShroudGuiApp {
                 .max_height(ui.available_height())
                 .show(ui, |ui| {
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(log_text)
-                                .monospace()
-                        )
+                        egui::Label::new(egui::RichText::new(log_text).monospace())
                             .selectable(true),
                     );
                 });
@@ -373,11 +411,81 @@ impl eframe::App for ShroudGuiApp {
     }
 }
 
-fn config_label(config: &ClientConfigFile) -> String {
-    if config.is_valid {
-        config.display_name.clone()
-    } else {
-        format!("{} (invalid)", config.display_name)
+fn config_summary(config: &ClientConfigFile) -> String {
+    let address = yaml_value_by_paths(
+        &config.raw_yaml,
+        &[
+            &["server", "host"],
+            &["server", "address"],
+            &["server_addr"],
+            &["endpoint", "host"],
+            &["remote", "host"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string());
+
+    let port = yaml_value_by_paths(
+        &config.raw_yaml,
+        &[
+            &["server", "port"],
+            &["port"],
+            &["endpoint", "port"],
+            &["remote", "port"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string());
+
+    let transport = yaml_value_by_paths(
+        &config.raw_yaml,
+        &[
+            &["transport"],
+            &["transport", "mode"],
+            &["transport_mode"],
+            &["mode"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string());
+
+    let invalid_suffix = if config.is_valid { "" } else { " (invalid)" };
+    format!(
+        "{}{} - {} - {} - {}",
+        config.display_name, invalid_suffix, address, port, transport
+    )
+}
+
+fn yaml_value_by_paths(raw_yaml: &str, paths: &[&[&str]]) -> Option<String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(raw_yaml).ok()?;
+
+    for path in paths {
+        if let Some(value) = yaml_value_at_path(&value, path) {
+            if let Some(text) = yaml_scalar_to_string(value) {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+fn yaml_value_at_path<'a>(
+    value: &'a serde_yaml::Value,
+    path: &[&str],
+) -> Option<&'a serde_yaml::Value> {
+    let mut current = value;
+
+    for key in path {
+        current = current.get(*key)?;
+    }
+
+    Some(current)
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
