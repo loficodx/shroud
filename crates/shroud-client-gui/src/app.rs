@@ -106,9 +106,14 @@ impl ShroudGuiApp {
         };
     }
 
-    fn save_editing_config(&mut self) {
-        let Some(path) = self.editing_config_path() else {
+    fn save_selected_config(&mut self) {
+        if self.expanded_config.is_none() {
             self.status = "open a config before saving".to_string();
+            return;
+        }
+
+        let Some(path) = self.editing_config_path() else {
+            self.status = "select a client config before saving".to_string();
             return;
         };
 
@@ -319,7 +324,7 @@ impl ShroudGuiApp {
                     }
 
                     if ui.button("Save").clicked() {
-                        self.save_editing_config();
+                        self.save_selected_config();
                     }
 
                     if ui.button("Cancel editing").clicked() {
@@ -517,6 +522,35 @@ fn discovered_configs_status(configs: &[ClientConfigFile]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "shroud-client-gui-app-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp test dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn client_config_file(raw_yaml: &str, is_valid: bool) -> ClientConfigFile {
         ClientConfigFile {
@@ -525,6 +559,26 @@ mod tests {
             raw_yaml: raw_yaml.to_string(),
             is_valid,
             error: None,
+        }
+    }
+
+    fn valid_client_yaml() -> &'static str {
+        include_str!("../../../configs/client.yaml")
+    }
+
+    fn app_with_configs(configs: Vec<ClientConfigFile>) -> ShroudGuiApp {
+        ShroudGuiApp {
+            config_store: ConfigStore::default(),
+            configs,
+            selected_config: None,
+            expanded_config: None,
+            editor_text: String::new(),
+            import_dialog_open: false,
+            import_text: String::new(),
+            pending_import_path: String::new(),
+            status: String::new(),
+            logs: LogBuffer::default(),
+            client_process: ClientProcess::default(),
         }
     }
 
@@ -566,22 +620,75 @@ transport:
 
     #[test]
     fn refresh_configs_with_selection_clears_expanded_config() {
-        let mut app = ShroudGuiApp {
-            config_store: ConfigStore::default(),
-            configs: Vec::new(),
-            selected_config: None,
-            expanded_config: Some(0),
-            editor_text: "unsaved: true".to_string(),
-            import_dialog_open: false,
-            import_text: String::new(),
-            pending_import_path: String::new(),
-            status: String::new(),
-            logs: LogBuffer::default(),
-            client_process: ClientProcess::default(),
-        };
+        let mut app = app_with_configs(Vec::new());
+        app.expanded_config = Some(0);
+        app.editor_text = "unsaved: true".to_string();
 
         app.refresh_configs_with_selection(None);
 
         assert_eq!(app.expanded_config, None);
+    }
+
+    #[test]
+    fn start_client_config_rejects_when_any_config_is_expanded() {
+        let mut first = client_config_file(valid_client_yaml(), true);
+        first.path = PathBuf::from("client-first.yaml");
+        let mut second = client_config_file(valid_client_yaml(), true);
+        second.path = PathBuf::from("client-second.yaml");
+        let mut app = app_with_configs(vec![first, second]);
+        app.expanded_config = Some(0);
+
+        app.start_client_config(1);
+
+        assert_eq!(app.status, "collapse the open config before starting");
+        assert_eq!(app.selected_config, None);
+    }
+
+    #[test]
+    fn validate_editor_rejects_without_edit_mode() {
+        let mut app = app_with_configs(vec![client_config_file(valid_client_yaml(), true)]);
+        app.selected_config = Some(0);
+        app.editor_text = valid_client_yaml().to_string();
+
+        app.validate_editor();
+
+        assert_eq!(app.status, "open a config before validating");
+    }
+
+    #[test]
+    fn save_selected_config_rejects_without_edit_mode() {
+        let dir = TestDir::new();
+        let path = dir.path().join("client-save.yaml");
+        let mut config = client_config_file(valid_client_yaml(), true);
+        config.path = path.clone();
+        let mut app = app_with_configs(vec![config]);
+        app.selected_config = Some(0);
+        app.editor_text = valid_client_yaml().to_string();
+
+        app.save_selected_config();
+
+        assert_eq!(app.status, "open a config before saving");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_selected_config_saves_editing_config_and_closes_edit_mode() {
+        let dir = TestDir::new();
+        let path = dir.path().join("client-save.yaml");
+        let mut config = client_config_file(valid_client_yaml(), true);
+        config.path = path.clone();
+        let mut app = app_with_configs(vec![config]);
+        app.selected_config = Some(0);
+        app.expanded_config = Some(0);
+        app.editor_text = valid_client_yaml().to_string();
+
+        app.save_selected_config();
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read saved config"),
+            valid_client_yaml()
+        );
+        assert_eq!(app.expanded_config, None);
+        assert_eq!(app.status, format!("saved {}", path.display()));
     }
 }
