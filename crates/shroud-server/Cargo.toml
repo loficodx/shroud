@@ -13,6 +13,7 @@ rcgen = "0.13"
 serde.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true

@@ -36,6 +36,39 @@ fn parse_cli() -> Result<Option<String>> {
     let first = args.next();
 
     match first.as_deref() {
+        Some("generate-certs") => {
+            let rest = args.collect::<Vec<_>>();
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_generate_certs_usage();
+                return Ok(None);
+            }
+            let options = parse_generate_certs_args(rest.into_iter())?;
+            let output = setup::run_generate_certs(options)?;
+            setup::print_generate_certs_output(&output);
+            Ok(None)
+        }
+        Some("add-client") => {
+            let rest = args.collect::<Vec<_>>();
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_add_client_usage();
+                return Ok(None);
+            }
+            let options = parse_add_client_args(rest.into_iter())?;
+            let output = setup::run_add_client(options)?;
+            setup::print_add_client_output(&output);
+            Ok(None)
+        }
+        Some("client-list") | Some("list-clients") => {
+            let rest = args.collect::<Vec<_>>();
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_client_list_usage();
+                return Ok(None);
+            }
+            let options = parse_client_list_args(rest.into_iter())?;
+            let output = setup::run_client_list(options)?;
+            setup::print_client_list_output(&output);
+            Ok(None)
+        }
         Some("setup") | Some("init") => {
             let rest = args.collect::<Vec<_>>();
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -62,6 +95,7 @@ fn parse_cli() -> Result<Option<String>> {
 fn parse_setup_args(mut args: impl Iterator<Item = String>) -> Result<setup::SetupOptions> {
     let mut server = None;
     let mut port = None;
+    let mut name = None;
     let mut config_path = PathBuf::from("configs/server.yaml");
     let mut cert_dir = PathBuf::from("certs");
     let mut force_certs = false;
@@ -70,6 +104,7 @@ fn parse_setup_args(mut args: impl Iterator<Item = String>) -> Result<setup::Set
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--server" => server = Some(next_arg(&mut args, "--server")?),
+            "--name" => name = Some(next_arg(&mut args, "--name")?),
             "--port" => {
                 let raw = next_arg(&mut args, "--port")?;
                 port = Some(
@@ -88,10 +123,98 @@ fn parse_setup_args(mut args: impl Iterator<Item = String>) -> Result<setup::Set
     Ok(setup::SetupOptions {
         server: server.ok_or_else(|| anyhow!("setup requires --server <host-or-ip>"))?,
         port: port.ok_or_else(|| anyhow!("setup requires --port <port>"))?,
+        name,
         config_path,
         cert_dir,
         force_certs,
         force_client,
+    })
+}
+
+fn parse_generate_certs_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<setup::GenerateCertsOptions> {
+    let mut server = None;
+    let mut config_path = PathBuf::from("configs/server.yaml");
+    let mut cert_dir = PathBuf::from("certs");
+    let mut force = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--server" => server = Some(next_arg(&mut args, "--server")?),
+            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
+            "--cert-dir" => cert_dir = PathBuf::from(next_arg(&mut args, "--cert-dir")?),
+            "--force" => force = true,
+            unknown => bail!("unknown generate-certs option: {unknown}"),
+        }
+    }
+
+    Ok(setup::GenerateCertsOptions {
+        server,
+        config_path,
+        cert_dir,
+        force,
+    })
+}
+
+fn parse_add_client_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<setup::AddClientOptions> {
+    let mut name = None;
+    let mut server = None;
+    let mut port = None;
+    let mut config_path = PathBuf::from("configs/server.yaml");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" => name = Some(next_arg(&mut args, "--name")?),
+            "--server" => server = Some(next_arg(&mut args, "--server")?),
+            "--port" => {
+                let raw = next_arg(&mut args, "--port")?;
+                port = Some(
+                    raw.parse::<u16>()
+                        .with_context(|| format!("invalid --port value: {raw}"))?,
+                );
+            }
+            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
+            unknown => bail!("unknown add-client option: {unknown}"),
+        }
+    }
+
+    Ok(setup::AddClientOptions {
+        name: Some(name.ok_or_else(|| anyhow!("add-client requires --name <name>"))?),
+        server: server.ok_or_else(|| anyhow!("add-client requires --server <host-or-ip>"))?,
+        port,
+        config_path,
+    })
+}
+
+fn parse_client_list_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<setup::ClientListOptions> {
+    let mut server = None;
+    let mut port = None;
+    let mut config_path = PathBuf::from("configs/server.yaml");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--server" => server = Some(next_arg(&mut args, "--server")?),
+            "--port" => {
+                let raw = next_arg(&mut args, "--port")?;
+                port = Some(
+                    raw.parse::<u16>()
+                        .with_context(|| format!("invalid --port value: {raw}"))?,
+                );
+            }
+            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
+            unknown => bail!("unknown client-list option: {unknown}"),
+        }
+    }
+
+    Ok(setup::ClientListOptions {
+        server: server.ok_or_else(|| anyhow!("client-list requires --server <host-or-ip>"))?,
+        port,
+        config_path,
     })
 }
 
@@ -105,8 +228,37 @@ fn print_setup_usage() {
     println!("  shroud-server setup --server <host-or-ip> --port <port> [options]");
     println!();
     println!("Options:");
+    println!("  --name <name>      Client display name stored in server.yaml");
     println!("  --config <path>    Server config path (default: configs/server.yaml)");
     println!("  --cert-dir <path>  Certificate directory (default: certs)");
     println!("  --force-certs      Regenerate server.crt and server.key");
     println!("  --force-client     Generate a new authorized client");
+}
+
+fn print_generate_certs_usage() {
+    println!("Usage:");
+    println!("  shroud-server generate-certs --server <host-or-ip> [options]");
+    println!();
+    println!("Options:");
+    println!("  --config <path>    Server config path (default: configs/server.yaml)");
+    println!("  --cert-dir <path>  Certificate directory (default: certs)");
+    println!("  --force            Regenerate server.crt and server.key");
+}
+
+fn print_add_client_usage() {
+    println!("Usage:");
+    println!("  shroud-server add-client --name <name> --server <host-or-ip> [options]");
+    println!();
+    println!("Options:");
+    println!("  --port <port>      Public server port (default: server.yaml listen port)");
+    println!("  --config <path>    Server config path (default: configs/server.yaml)");
+}
+
+fn print_client_list_usage() {
+    println!("Usage:");
+    println!("  shroud-server client-list --server <host-or-ip> [options]");
+    println!();
+    println!("Options:");
+    println!("  --port <port>      Public server port (default: server.yaml listen port)");
+    println!("  --config <path>    Server config path (default: configs/server.yaml)");
 }

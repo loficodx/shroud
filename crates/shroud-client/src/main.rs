@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use shroud_client::{routing, session, socks5, transport, tun};
 use shroud_core::config::load_client_config_yaml;
+use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -26,7 +29,14 @@ async fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let config_path = parse_cli()?;
+    let command = parse_cli()?;
+    let ClientCommand::Run { config_path } = command else {
+        if let ClientCommand::Import(options) = command {
+            run_import_command(options)?;
+        }
+        return Ok(());
+    };
+
     let raw = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let cfg = load_client_config_yaml(&raw)
@@ -110,11 +120,24 @@ async fn main() -> Result<()> {
     socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
-fn parse_cli() -> Result<String> {
+fn parse_cli() -> Result<ClientCommand> {
     parse_cli_args(std::env::args().skip(1))
 }
 
-fn parse_cli_args<I, S>(args: I) -> Result<String>
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientCommand {
+    Run { config_path: String },
+    Import(ImportOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportOptions {
+    raw: String,
+    output: Option<String>,
+    force: bool,
+}
+
+fn parse_cli_args<I, S>(args: I) -> Result<ClientCommand>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -127,29 +150,235 @@ where
         Some("generate-credentials") | Some("gen-credentials")
     ) {
         bail!(
-            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
         );
     }
 
-    Ok(first.unwrap_or_else(|| "configs/client.yaml".to_string()))
+    if matches!(first.as_deref(), Some("import")) {
+        return parse_import_args(args.map(Into::into));
+    }
+
+    Ok(ClientCommand::Run {
+        config_path: first.unwrap_or_else(|| "configs/client.yaml".to_string()),
+    })
+}
+
+fn parse_import_args(mut args: impl Iterator<Item = String>) -> Result<ClientCommand> {
+    let mut raw = None;
+    let mut output = None;
+    let mut force = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--output" | "-o" => output = Some(next_arg(&mut args, "--output")?),
+            "--force" => force = true,
+            "--help" | "-h" => {
+                bail!("Usage: shroud-client import <shrd:1:...> [--output <path>] [--force]")
+            }
+            unknown if unknown.starts_with('-') => bail!("unknown import option: {unknown}"),
+            value => {
+                if raw.replace(value.to_string()).is_some() {
+                    bail!("import accepts exactly one import string");
+                }
+            }
+        }
+    }
+
+    Ok(ClientCommand::Import(ImportOptions {
+        raw: raw.ok_or_else(|| {
+            anyhow::anyhow!(
+                "import requires an import string.\nUsage: shroud-client import <shrd:1:...> [--output <path>] [--force]"
+            )
+        })?,
+        output,
+        force,
+    }))
+}
+
+fn next_arg(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
+    args.next()
+        .ok_or_else(|| anyhow::anyhow!("{option} requires a value"))
+}
+
+fn run_import_command(options: ImportOptions) -> Result<()> {
+    let conn = decode_import_connection(&options.raw)?;
+    let output_path = options
+        .output
+        .unwrap_or_else(|| default_import_output_path(conn.name.as_deref()));
+    let yaml = render_client_yaml_from_import(conn)?;
+    create_parent_dir(Path::new(&output_path))?;
+
+    if options.force {
+        fs::write(&output_path, yaml)
+            .with_context(|| format!("failed to write client config: {output_path}"))?;
+    } else {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .with_context(|| {
+                format!("failed to create client config: {output_path}. Use --force to overwrite")
+            })?;
+        file.write_all(yaml.as_bytes())
+            .with_context(|| format!("failed to write client config: {output_path}"))?;
+    }
+
+    println!("Client config written: {output_path}");
+    Ok(())
+}
+
+fn create_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn default_import_output_path(name: Option<&str>) -> String {
+    format!(
+        "client-{}.yaml",
+        sanitize_profile_name(name.unwrap_or("import"))
+    )
+}
+
+fn sanitize_profile_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if (ch == '-' || ch == '_') && !out.is_empty() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "import".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cli_args;
+    use super::{
+        ClientCommand, ImportOptions, default_import_output_path, parse_cli_args,
+        run_import_command,
+    };
+    use shroud_core::config::{TransportMode, load_client_config_yaml};
+    use shroud_core::import::{ImportConnection, encode_import_connection};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parse_cli_defaults_to_sample_client_config() {
         let config_path = parse_cli_args(std::iter::empty::<&str>()).expect("parse default config");
 
-        assert_eq!(config_path, "configs/client.yaml");
+        assert_eq!(
+            config_path,
+            ClientCommand::Run {
+                config_path: "configs/client.yaml".to_string()
+            }
+        );
     }
 
     #[test]
     fn parse_cli_accepts_config_path() {
         let config_path = parse_cli_args(["custom-client.yaml"]).expect("parse custom config");
 
-        assert_eq!(config_path, "custom-client.yaml");
+        assert_eq!(
+            config_path,
+            ClientCommand::Run {
+                config_path: "custom-client.yaml".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_import_command() {
+        let command = parse_cli_args([
+            "import",
+            "shrd:1:test",
+            "--output",
+            "configs/client-laptop.yaml",
+            "--force",
+        ])
+        .expect("parse import command");
+
+        assert_eq!(
+            command,
+            ClientCommand::Import(ImportOptions {
+                raw: "shrd:1:test".to_string(),
+                output: Some("configs/client-laptop.yaml".to_string()),
+                force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn import_output_path_uses_profile_name() {
+        assert_eq!(
+            default_import_output_path(Some("Work Laptop")),
+            "client-work-laptop.yaml"
+        );
+        assert_eq!(
+            default_import_output_path(Some("!!!")),
+            "client-import.yaml"
+        );
+    }
+
+    #[test]
+    fn import_command_writes_valid_client_config_without_overwriting_by_default() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let output_path = dir.join("client-laptop.yaml");
+        let raw = encode_import_connection(&ImportConnection {
+            name: Some("laptop".to_string()),
+            server: "127.0.0.1".to_string(),
+            port: 8443,
+            mode: TransportMode::RawTcp,
+            tls: true,
+            tls_server_name: Some("localhost".to_string()),
+            tls_server_cert_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7".to_string(),
+            client_secret: "secret".to_string(),
+        })
+        .expect("encode import string");
+
+        run_import_command(ImportOptions {
+            raw: raw.clone(),
+            output: Some(output_path.to_string_lossy().into_owned()),
+            force: false,
+        })
+        .expect("import config");
+
+        let yaml = fs::read_to_string(&output_path).expect("read imported config");
+        let config = load_client_config_yaml(&yaml).expect("generated config is valid");
+        assert_eq!(config.transport.server, "127.0.0.1");
+        assert_eq!(config.auth.client_secret, "secret");
+
+        let err = run_import_command(ImportOptions {
+            raw,
+            output: Some(output_path.to_string_lossy().into_owned()),
+            force: false,
+        })
+        .expect_err("reject overwrite");
+        assert!(err.to_string().contains("Use --force to overwrite"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -158,7 +387,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
         );
     }
 
@@ -168,7 +397,18 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Credential generation moved to shroud-server setup.\nRun: shroud-server setup --server <host> --port <port>"
+            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
         );
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "shroud-client-import-test-{}-{now}",
+            std::process::id()
+        ))
     }
 }

@@ -801,8 +801,10 @@ mod tests {
             limits: Default::default(),
             security: ServerSecurityConfig::default(),
             clients: vec![AuthorizedClient {
+                name: None,
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),
+                created_at: None,
             }],
         };
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
@@ -1061,8 +1063,10 @@ mod tests {
             limits: Default::default(),
             security: ServerSecurityConfig::default(),
             clients: vec![AuthorizedClient {
+                name: None,
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),
+                created_at: None,
             }],
         };
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));

@@ -17,7 +17,7 @@ transport:
   port: 8443
   tls: true
   tls_server_name: "localhost"
-  # Replace with the value printed by `shroud-server setup`.
+  # Replace with the value printed by `shroud-server generate-certs`.
   tls_server_cert_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 timeouts:

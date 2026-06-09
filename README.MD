@@ -32,7 +32,7 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
   - HMAC-based auth proof;
   - timestamp skew validation;
   - nonce replay protection;
-  - server setup command that generates/reuses authorized client credentials.
+  - server provisioning commands for TLS certificates, client creation, and import-string listing.
 - Routing on the client:
   - `proxy`, `direct`, and `block` actions;
   - exact domain rules;
@@ -174,7 +174,7 @@ transport:
   port: 8443
   tls: true
   tls_server_name: "localhost"
-  # Replace with the value printed by `shroud-server setup`.
+  # Replace with the value printed by `shroud-server generate-certs`.
   tls_server_cert_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 timeouts:
@@ -241,75 +241,86 @@ security:
   deny_private_ips: true
   allow_ports: []
 clients:
-  - client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
+  - name: "laptop"
+    client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
     client_secret: "replace-with-random-secret"
+    created_at: "2026-06-09T18:00:00Z"
 ```
 
 `security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
 
 ## Server Setup
 
-Recommended setup creates or updates `configs/server.yaml`, creates/reuses `certs/server.crt` and `certs/server.key`, ensures there is an authorized client, and prints a copy-paste client config snippet:
+Recommended provisioning is split into independent commands:
+
+- `generate-certs` creates or reuses the server TLS certificate/key and updates only `tls.*` in `server.yaml`.
+- `add-client` creates one authorized client, appends it to `server.yaml`, and prints a `shrd:1:<base64url-json>` import string.
+- `client-list` prints import strings for existing clients without modifying `server.yaml`.
 
 ```bash
-cargo run -p shroud-server -- setup --server 127.0.0.1 --port 8443
+cargo run -p shroud-server -- generate-certs --server 127.0.0.1 --config configs/server.yaml --cert-dir certs
+cargo run -p shroud-server -- add-client --name laptop --server 127.0.0.1 --config configs/server.yaml
 ```
 
 For a remote host, use the public IP or DNS name clients will connect to:
 
 ```bash
-cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443
+cargo run -p shroud-server -- generate-certs --server 104.20.23.154 --config configs/server.yaml --cert-dir certs
+cargo run -p shroud-server -- add-client --name laptop --server 104.20.23.154 --port 8443 --config configs/server.yaml
 ```
 
-`setup` generates a self-signed server certificate directly. It does not create or require a local CA. The generated certificate always includes `localhost` and `127.0.0.1` as subject alternative names; when `--server` is another IP or DNS name, that value is added too.
+`generate-certs` generates a self-signed server certificate directly. It does not create or require a local CA. The generated certificate always includes `localhost` and `127.0.0.1` as subject alternative names; when `--server` is another IP or DNS name, that value is added too.
 
-Useful setup options:
+Useful provisioning commands:
 
 ```bash
-cargo run -p shroud-server -- setup --help
-cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --config configs/server.yaml --cert-dir certs
-cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --force-certs
-cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --force-client
+cargo run -p shroud-server -- generate-certs --help
+cargo run -p shroud-server -- generate-certs --server 104.20.23.154 --config configs/server.yaml --cert-dir certs --force
+cargo run -p shroud-server -- add-client --help
+cargo run -p shroud-server -- add-client --name phone --server 104.20.23.154 --port 8443
+cargo run -p shroud-server -- client-list --server 104.20.23.154 --port 8443
 ```
 
 Behavior:
 
 - `--config` selects the server config path; default is `configs/server.yaml`.
-- `--cert-dir` selects where `server.crt` and `server.key` are generated; default is `certs`.
-- existing non-empty `tls.cert_path` and `tls.key_path` in the server config are preserved unless `--force-certs` is used.
-- existing certificate/key files are reused unless `--force-certs` is used.
-- the first existing authorized client is reused unless `--force-client` is used.
-- `--force-client` replaces the configured client list with one newly generated client.
+- `generate-certs --cert-dir` selects where `server.crt` and `server.key` are generated; default is `certs`.
+- existing non-empty `tls.cert_path` and `tls.key_path` in the server config are preserved unless `generate-certs --force` is used.
+- existing certificate/key files are reused unless `generate-certs --force` is used.
+- `add-client` fails if the server certificate/key is missing; run `generate-certs` first.
+- `add-client` rejects duplicate client names.
+- `client-list` never writes to the server config.
 - the private key is written with `0600` permissions on Unix.
 
-The command prints:
+`add-client` prints:
 
 ```text
-Shroud server setup complete.
+Client created:
 
-Generated or reused:
-  server config: configs/server.yaml
-  server cert:   certs/server.crt
-  server key:    certs/server.key
+name: laptop
+client_id: c1ce8312-7c35-4e70-867a-3af4ac7f68d7
 
-Use this client config:
-
-transport:
-  mode: raw_tcp
-  server: "104.20.23.154"
-  port: 8443
-  tls: true
-  tls_server_name: "104.20.23.154"
-  tls_server_cert_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-auth:
-  client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
-  client_secret: "replace-with-generated-secret"
+Import string:
+shrd:1:eyJuYW1lIjoibGFwdG9wIiwic2VydmVyIjoiMTA0LjIwLjIzLjE1NCIs...
 ```
 
-Put the printed `transport` and `auth` blocks into the client config. The client verifies the exact server certificate with `tls_server_cert_sha256`, so copying a local CA certificate to the client is not required.
+Import strings contain client credentials. Do not share them publicly.
 
-The old `scripts/generate-certs.sh` helper is still present for manual development workflows that need a local CA and an OpenSSL-generated server certificate. It is not required for the recommended `setup` workflow.
+Create a client config from an import string:
+
+```bash
+cargo run -p shroud-client -- import 'shrd:1:...' --output configs/client-laptop.yaml
+```
+
+If `--output` is omitted, the client writes `client-<name>.yaml` using the profile name from the import string. Existing files are not overwritten unless `--force` is passed.
+
+`setup` is still available as a compatibility shortcut. It runs the same provisioning path and prints a note recommending `generate-certs` and `add-client` for production use:
+
+```bash
+cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --name laptop
+```
+
+The old `scripts/generate-certs.sh` helper is still present for manual development workflows that need a local CA and an OpenSSL-generated server certificate. It is not required for the recommended provisioning workflow.
 
 Legacy/manual credential generation still exists on the server for development:
 

@@ -102,6 +102,47 @@ impl ClientConfig {
     pub fn transport_compat_warnings(&self) -> &[String] {
         &self.transport_compat_warnings
     }
+
+    pub fn default_for_import(conn: crate::import::ImportConnection) -> Self {
+        let transport = TransportConfig {
+            mode: conn.mode,
+            server: conn.server,
+            port: conn.port,
+            tls: conn.tls,
+            tls_server_name: conn.tls_server_name,
+            tls_ca_cert_path: None,
+            tls_server_cert_sha256: Some(conn.tls_server_cert_sha256),
+            path: None,
+        };
+        let outbound = OutboundConfig::from_transport(&transport);
+
+        Self {
+            inbound: Some(SocksInboundConfig {
+                enabled: true,
+                listen: SocketAddr::from(([127, 0, 0, 1], 1080)),
+            }),
+            inbounds: ClientInboundsConfig {
+                socks: Some(SocksInboundConfig {
+                    enabled: true,
+                    listen: SocketAddr::from(([127, 0, 0, 1], 1080)),
+                }),
+                tun: TunInboundConfig::default(),
+            },
+            transport,
+            outbound,
+            auth: ClientAuthConfig {
+                client_id: conn.client_id,
+                client_secret: conn.client_secret,
+            },
+            timeouts: TimeoutsConfig::default(),
+            relay: RelayConfig::default(),
+            limits: LimitsConfig::default(),
+            routing: RoutingConfig::default(),
+            dns: ClientDnsConfig::default(),
+            transport_source: TransportConfigSource::Transport,
+            transport_compat_warnings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,10 +577,14 @@ pub struct ServerTlsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizedClient {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default)]
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,6 +774,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     for (index, client) in config.clients.iter().enumerate() {
         validate_authorized_client_config(&mut errors, &format!("clients[{index}]"), client);
     }
+    validate_unique_authorized_client_names(&mut errors, &config.clients);
     validate_server_transport_config(&mut errors, "transport", &config.transport);
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
     validate_relay_config(&mut errors, "relay", &config.relay);
@@ -974,12 +1020,39 @@ fn validate_authorized_client_config(
     base_path: &str,
     client: &AuthorizedClient,
 ) {
+    if let Some(name) = &client.name {
+        validate_non_empty(errors, &format!("{base_path}.name"), name);
+    }
     validate_client_id(errors, &format!("{base_path}.client_id"), &client.client_id);
     validate_non_empty(
         errors,
         &format!("{base_path}.client_secret"),
         &client.client_secret,
     );
+}
+
+fn validate_unique_authorized_client_names(
+    errors: &mut Vec<ConfigFieldError>,
+    clients: &[AuthorizedClient],
+) {
+    for (index, client) in clients.iter().enumerate() {
+        let Some(name) = client.name.as_deref().map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if clients
+            .iter()
+            .take(index)
+            .any(|existing| existing.name.as_deref().map(str::trim) == Some(name))
+        {
+            errors.push(ConfigFieldError::new(
+                format!("clients[{index}].name"),
+                format!("duplicate client name: {name}"),
+            ));
+        }
+    }
 }
 
 fn validate_routing_config_into(

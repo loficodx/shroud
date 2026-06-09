@@ -78,8 +78,10 @@ mod tests {
 
     fn clients() -> Vec<AuthorizedClient> {
         vec![AuthorizedClient {
+            name: None,
             client_id: CLIENT_ID.to_string(),
             client_secret: CLIENT_SECRET.to_string(),
+            created_at: None,
         }]
     }
 
