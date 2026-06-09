@@ -1,0 +1,15 @@
+[package]
+name = "shroud-client-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+eframe.workspace = true
+egui.workspace = true
+glob.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+shroud-core = { path = "../shroud-core" }

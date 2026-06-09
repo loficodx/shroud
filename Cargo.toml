@@ -3,6 +3,7 @@ members = [
     "crates/shroud-core",
     "crates/shroud-client",
     "crates/shroud-server",
+    "crates/shroud-client-gui",
 ]
 resolver = "2"
 
@@ -15,7 +16,11 @@ version = "0.1.0"
 anyhow = "1.0"
 base64 = "0.22"
 bytes = "1.10"
+crossbeam-channel = "0.5"
+eframe = "0.28"
+egui = "0.28"
 futures-util = "0.3"
+glob = "0.3"
 hmac = "0.12"
 netstack-smoltcp = "0.2.2"
 serde = { version = "1.0", features = ["derive"] }
