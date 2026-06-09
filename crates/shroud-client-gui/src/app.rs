@@ -1,15 +1,17 @@
 use crate::config_store::{ClientConfigFile, ConfigStore};
-use crate::import::{default_import_file_name, render_imported_client_yaml};
+use crate::import::{render_imported_client_yaml, unique_import_file_path};
 use crate::logs::LogBuffer;
 use crate::process::ClientProcess;
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct ShroudGuiApp {
     config_store: ConfigStore,
     configs: Vec<ClientConfigFile>,
     selected_config: Option<usize>,
     editor_text: String,
+    import_dialog_open: bool,
     import_text: String,
     pending_import_path: String,
     status: String,
@@ -33,6 +35,7 @@ impl ShroudGuiApp {
             configs,
             selected_config: None,
             editor_text: String::new(),
+            import_dialog_open: false,
             import_text: String::new(),
             pending_import_path: String::new(),
             status,
@@ -123,35 +126,85 @@ impl ShroudGuiApp {
         }
     }
 
-    fn render_import(&mut self) {
+    fn suggest_import_file_name(&mut self) {
         match render_imported_client_yaml(&self.import_text) {
-            Ok((yaml, name)) => {
-                self.editor_text = yaml;
-                self.pending_import_path = default_import_file_name(name.as_deref());
-                self.selected_config = None;
-                self.status = format!(
-                    "import rendered; save it as {} when ready",
-                    self.pending_import_path
-                );
+            Ok(imported) => {
+                let path = unique_import_file_path(Path::new(&imported.default_file_name));
+                self.pending_import_path = path.display().to_string();
+                self.status = format!("suggested import file {}", path.display());
             }
             Err(err) => self.status = err.to_string(),
         }
     }
 
-    fn save_imported_config(&mut self) {
-        let path = if self.pending_import_path.trim().is_empty() {
-            PathBuf::from(default_import_file_name(None))
+    fn import_connection(&mut self) -> bool {
+        let imported = match render_imported_client_yaml(&self.import_text) {
+            Ok(imported) => imported,
+            Err(err) => {
+                self.status = err.to_string();
+                return false;
+            }
+        };
+
+        let requested_path = if self.pending_import_path.trim().is_empty() {
+            PathBuf::from(imported.default_file_name)
         } else {
             PathBuf::from(self.pending_import_path.trim())
         };
+        let path = unique_import_file_path(&requested_path);
 
-        match self.config_store.save(&path, &self.editor_text) {
+        match self.config_store.save(&path, &imported.yaml) {
             Ok(()) => {
                 self.refresh_configs_with_selection(Some(&path));
                 self.status = format!("saved {}", path.display());
+                self.pending_import_path = path.display().to_string();
+                true
             }
-            Err(err) => self.status = err.to_string(),
+            Err(err) => {
+                self.status = err.to_string();
+                false
+            }
         }
+    }
+
+    fn show_import_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.import_dialog_open;
+        let mut should_close = false;
+
+        egui::Window::new("Import Connection")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("Paste shrd string:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.import_text)
+                        .desired_rows(4)
+                        .code_editor(),
+                );
+
+                ui.horizontal(|ui| {
+                    ui.label("Config filename:");
+                    ui.text_edit_singleline(&mut self.pending_import_path);
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Suggest Filename").clicked() {
+                        self.suggest_import_file_name();
+                    }
+                    if ui.button("Import").clicked() && self.import_connection() {
+                        should_close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        should_close = true;
+                    }
+                });
+            });
+
+        if should_close {
+            open = false;
+        }
+        self.import_dialog_open = open;
     }
 
     fn start_client(&mut self) {
@@ -180,9 +233,15 @@ impl ShroudGuiApp {
 
 impl eframe::App for ShroudGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.logs.drain();
+        let drained_logs = self.logs.drain();
         let is_running = self.client_process.is_running();
         let process_state = self.client_process.state();
+        if is_running {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if drained_logs > 0 {
+            ctx.request_repaint();
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -206,6 +265,10 @@ impl eframe::App for ShroudGuiApp {
 
                 if ui.button("Refresh").clicked() {
                     self.refresh_configs();
+                }
+
+                if ui.button("Import Connection").clicked() {
+                    self.import_dialog_open = true;
                 }
 
                 if ui
@@ -234,6 +297,8 @@ impl eframe::App for ShroudGuiApp {
                 }
             });
         });
+
+        self.show_import_dialog(ctx);
 
         egui::SidePanel::left("configs")
             .resizable(true)
@@ -266,29 +331,6 @@ impl eframe::App for ShroudGuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Shroud Client");
-            ui.separator();
-
-            ui.collapsing("Import Connection", |ui| {
-                ui.label("Paste a shrd:1:... import string.");
-                ui.text_edit_singleline(&mut self.import_text);
-                ui.horizontal(|ui| {
-                    if ui.button("Render Config").clicked() {
-                        self.render_import();
-                    }
-                    ui.label("Output file:");
-                    ui.text_edit_singleline(&mut self.pending_import_path);
-                    if ui
-                        .add_enabled(
-                            !self.editor_text.trim().is_empty(),
-                            egui::Button::new("Save Import"),
-                        )
-                        .clicked()
-                    {
-                        self.save_imported_config();
-                    }
-                });
-            });
-
             ui.separator();
             ui.label("Client config YAML");
             ui.add(

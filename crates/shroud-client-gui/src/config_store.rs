@@ -90,6 +90,7 @@ impl ConfigStore {
 
     pub fn save(&self, path: &Path, raw: &str) -> Result<()> {
         self.validate(raw)?;
+        create_parent_dir(path)?;
         let tmp_path = atomic_save_tmp_path(path);
         fs::write(&tmp_path, raw).with_context(|| {
             format!(
@@ -106,6 +107,17 @@ impl ConfigStore {
     pub fn validate(&self, raw: &str) -> Result<()> {
         load_client_config_yaml(raw).map(|_| ()).map_err(Into::into)
     }
+}
+
+fn create_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn atomic_save_tmp_path(path: &Path) -> PathBuf {
@@ -170,6 +182,23 @@ mod tests {
             valid_client_yaml()
         );
         assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn save_creates_parent_directory() {
+        let dir = TestDir::new();
+        let path = dir.path().join("configs/client-laptop.yaml");
+
+        let store = ConfigStore {
+            search_patterns: Vec::new(),
+        };
+
+        store.save(&path, valid_client_yaml()).expect("save config");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read saved config"),
+            valid_client_yaml()
+        );
     }
 
     #[test]

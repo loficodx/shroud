@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 const IMPORT_PREFIX: &str = "shrd:1:";
+const IMPORT_SCHEME_PREFIX: &str = "shrd:";
+const IMPORT_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportConnection {
@@ -30,14 +32,24 @@ pub fn encode_import_connection(conn: &ImportConnection) -> Result<String> {
 }
 
 pub fn decode_import_connection(raw: &str) -> Result<ImportConnection> {
-    let encoded = raw
+    let body = raw
         .trim()
-        .strip_prefix(IMPORT_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("unsupported import string format"))?;
+        .strip_prefix(IMPORT_SCHEME_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("invalid import string prefix, expected shrd:1:"))?;
+    let (version, encoded) = body
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid import string prefix, expected shrd:1:"))?;
+    if version != IMPORT_VERSION {
+        if version.parse::<u64>().is_ok() {
+            anyhow::bail!("unsupported import version: {version}");
+        }
+        anyhow::bail!("invalid import string prefix, expected shrd:1:");
+    }
+
     let json = URL_SAFE_NO_PAD
         .decode(encoded)
-        .context("failed to decode import string payload")?;
-    serde_json::from_slice(&json).context("failed to parse import string payload")
+        .context("failed to decode import payload")?;
+    serde_json::from_slice(&json).context("failed to parse import payload")
 }
 
 pub fn client_config_from_import(conn: ImportConnection) -> ClientConfig {
@@ -126,10 +138,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_import_prefix() {
+    fn rejects_invalid_import_prefix() {
+        let err = decode_import_connection("not-shrd:1:abc").expect_err("reject prefix");
+
+        assert!(
+            err.to_string()
+                .contains("invalid import string prefix, expected shrd:1:")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_import_version() {
         let err = decode_import_connection("shrd:2:abc").expect_err("reject version");
 
-        assert!(err.to_string().contains("unsupported import string format"));
+        assert!(err.to_string().contains("unsupported import version: 2"));
+    }
+
+    #[test]
+    fn rejects_broken_import_base64() {
+        let err = decode_import_connection("shrd:1:%%%").expect_err("reject base64");
+
+        assert!(err.to_string().contains("failed to decode import payload"));
+    }
+
+    #[test]
+    fn rejects_broken_import_json() {
+        let encoded = format!("shrd:1:{}", URL_SAFE_NO_PAD.encode(b"not-json"));
+        let err = decode_import_connection(&encoded).expect_err("reject json");
+
+        assert!(err.to_string().contains("failed to parse import payload"));
     }
 
     #[test]
@@ -138,7 +175,28 @@ mod tests {
 
         validate_client_config(&config).expect("valid generated config");
         assert_eq!(config.transport.server, "138.124.55.220");
+        assert_eq!(config.transport.port, 8443);
+        assert_eq!(
+            config.transport.tls_server_name.as_deref(),
+            Some("138.124.55.220")
+        );
+        assert_eq!(
+            config.transport.tls_server_cert_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            config.auth.client_id,
+            "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
+        );
         assert_eq!(config.auth.client_secret, "secret");
+        let socks = config
+            .inbounds
+            .socks
+            .as_ref()
+            .expect("default socks inbound");
+        assert!(socks.enabled);
+        assert_eq!(socks.listen.to_string(), "127.0.0.1:1080");
+        assert!(!config.inbounds.tun.enabled);
     }
 
     #[test]

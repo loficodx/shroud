@@ -149,7 +149,12 @@ struct ClientCommand {
 fn build_client_command(config_path: &Path) -> ClientCommand {
     ClientCommand {
         program: resolve_client_binary(),
-        args: vec![config_path.as_os_str().to_os_string()],
+        args: vec![
+            OsString::from("--config"),
+            config_path.as_os_str().to_os_string(),
+            OsString::from("--log-format"),
+            OsString::from("plain"),
+        ],
     }
 }
 
@@ -255,9 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn build_client_command_passes_config_path_as_positional_arg() {
+    fn build_client_command_passes_config_path_as_explicit_config_arg() {
         let command = build_client_command(Path::new("configs/client.yaml"));
 
-        assert_eq!(command.args, vec![OsString::from("configs/client.yaml")]);
+        assert_eq!(
+            command.args,
+            vec![
+                OsString::from("--config"),
+                OsString::from("configs/client.yaml"),
+                OsString::from("--log-format"),
+                OsString::from("plain")
+            ]
+        );
     }
 }

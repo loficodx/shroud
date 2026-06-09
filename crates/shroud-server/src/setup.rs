@@ -688,6 +688,7 @@ fn chmod_public_cert(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shroud_core::import::decode_import_connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -730,6 +731,50 @@ mod tests {
         assert_eq!(config.clients.len(), 1);
         assert_eq!(config.clients[0].client_id, output.client_id);
         assert!(config.clients[0].created_at.is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generate_certs_creates_reuses_and_force_replaces_cert_pair() {
+        let dir = unique_temp_dir();
+        let config_path = dir.join("configs/server.yaml");
+        let cert_dir = dir.join("certs");
+
+        let first = run_generate_certs(GenerateCertsOptions {
+            server: Some("127.0.0.1".to_string()),
+            config_path: config_path.clone(),
+            cert_dir: cert_dir.clone(),
+            force: false,
+        })
+        .expect("generate certs first time");
+        assert!(first.server_cert_path.is_file());
+        assert!(first.server_key_path.is_file());
+        assert!(!first.fingerprint_changed);
+
+        let raw_config = fs::read_to_string(&config_path).expect("read generated server config");
+        assert!(raw_config.contains("cert_path:"));
+        assert!(raw_config.contains("key_path:"));
+
+        let second = run_generate_certs(GenerateCertsOptions {
+            server: Some("127.0.0.1".to_string()),
+            config_path: config_path.clone(),
+            cert_dir: cert_dir.clone(),
+            force: false,
+        })
+        .expect("reuse existing certs");
+        assert_eq!(second.cert_sha256, first.cert_sha256);
+        assert!(!second.fingerprint_changed);
+
+        let third = run_generate_certs(GenerateCertsOptions {
+            server: Some("127.0.0.1".to_string()),
+            config_path,
+            cert_dir,
+            force: true,
+        })
+        .expect("force replace certs");
+        assert_ne!(third.cert_sha256, first.cert_sha256);
+        assert!(third.fingerprint_changed);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -950,6 +995,12 @@ clients:
         assert_eq!(output.clients.len(), 1);
         assert_eq!(output.clients[0].name.as_deref(), Some("laptop"));
         assert!(output.clients[0].import_string.starts_with("shrd:1:"));
+        let decoded =
+            decode_import_connection(&output.clients[0].import_string).expect("decode import");
+        assert_eq!(decoded.name.as_deref(), Some("laptop"));
+        assert_eq!(decoded.server, "127.0.0.1");
+        assert_eq!(decoded.port, 8443);
+        assert_eq!(decoded.client_id, output.clients[0].client_id);
         assert_eq!(before, after);
 
         let _ = fs::remove_dir_all(dir);

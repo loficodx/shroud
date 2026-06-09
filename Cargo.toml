@@ -33,7 +33,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.48", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 rustls-pemfile = "2.2"
 webpki-roots = "0.26"

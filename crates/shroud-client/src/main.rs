@@ -26,17 +26,24 @@ use tracing_subscriber::EnvFilter;
 // sudo SHROUD_SMOKE_BUILD=0 ./scripts/tun-smoke-linux.sh
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
-
     let command = parse_cli()?;
-    let ClientCommand::Run { config_path } = command else {
-        if let ClientCommand::Import(options) = command {
-            run_import_command(options)?;
+    match command {
+        ClientCommand::Run {
+            config_path,
+            log_format,
+        } => {
+            init_tracing(log_format);
+            run_client(config_path).await
         }
-        return Ok(());
-    };
+        ClientCommand::Import(options) => {
+            init_tracing(LogFormat::Plain);
+            run_import_command(options)?;
+            Ok(())
+        }
+    }
+}
 
+async fn run_client(config_path: String) -> Result<()> {
     let raw = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
     let cfg = load_client_config_yaml(&raw)
@@ -120,14 +127,34 @@ async fn main() -> Result<()> {
     socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
+fn init_tracing(log_format: LogFormat) {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    match log_format {
+        LogFormat::Plain => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init(),
+    }
+}
+
 fn parse_cli() -> Result<ClientCommand> {
     parse_cli_args(std::env::args().skip(1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
-    Run { config_path: String },
+    Run {
+        config_path: String,
+        log_format: LogFormat,
+    },
     Import(ImportOptions),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Plain,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,9 +185,47 @@ where
         return parse_import_args(args.map(Into::into));
     }
 
+    parse_run_args(first.into_iter().chain(args.map(Into::into)))
+}
+
+fn parse_run_args(args: impl Iterator<Item = String>) -> Result<ClientCommand> {
+    let mut config_path = None;
+    let mut log_format = LogFormat::Plain;
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                set_config_path(&mut config_path, next_arg(&mut args, "--config")?)?
+            }
+            "--log-format" => log_format = parse_log_format(&next_arg(&mut args, "--log-format")?)?,
+            "--help" | "-h" => bail!(
+                "Usage: shroud-client [--config <path>] [--log-format plain|json]\n       shroud-client <config-path>\n       shroud-client import <shrd:1:...> [--output <path>] [--force]"
+            ),
+            unknown if unknown.starts_with('-') => bail!("unknown client option: {unknown}"),
+            value => set_config_path(&mut config_path, value.to_string())?,
+        }
+    }
+
     Ok(ClientCommand::Run {
-        config_path: first.unwrap_or_else(|| "configs/client.yaml".to_string()),
+        config_path: config_path.unwrap_or_else(|| "configs/client.yaml".to_string()),
+        log_format,
     })
+}
+
+fn set_config_path(config_path: &mut Option<String>, value: String) -> Result<()> {
+    if config_path.replace(value).is_some() {
+        bail!("client accepts only one config path");
+    }
+    Ok(())
+}
+
+fn parse_log_format(value: &str) -> Result<LogFormat> {
+    match value {
+        "plain" => Ok(LogFormat::Plain),
+        "json" => Ok(LogFormat::Json),
+        _ => bail!("unsupported log format: {value}. Expected plain or json"),
+    }
 }
 
 fn parse_import_args(mut args: impl Iterator<Item = String>) -> Result<ClientCommand> {
@@ -202,9 +267,14 @@ fn next_arg(args: &mut impl Iterator<Item = String>, option: &str) -> Result<Str
 
 fn run_import_command(options: ImportOptions) -> Result<()> {
     let conn = decode_import_connection(&options.raw)?;
+    let default_file_name_source = conn
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&conn.server);
     let output_path = options
         .output
-        .unwrap_or_else(|| default_import_output_path(conn.name.as_deref()));
+        .unwrap_or_else(|| default_import_output_path(Some(default_file_name_source)));
     let yaml = render_client_yaml_from_import(conn)?;
     create_parent_dir(Path::new(&output_path))?;
 
@@ -273,7 +343,7 @@ fn sanitize_profile_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientCommand, ImportOptions, default_import_output_path, parse_cli_args,
+        ClientCommand, ImportOptions, LogFormat, default_import_output_path, parse_cli_args,
         run_import_command,
     };
     use shroud_core::config::{TransportMode, load_client_config_yaml};
@@ -289,7 +359,8 @@ mod tests {
         assert_eq!(
             config_path,
             ClientCommand::Run {
-                config_path: "configs/client.yaml".to_string()
+                config_path: "configs/client.yaml".to_string(),
+                log_format: LogFormat::Plain,
             }
         );
     }
@@ -301,7 +372,41 @@ mod tests {
         assert_eq!(
             config_path,
             ClientCommand::Run {
-                config_path: "custom-client.yaml".to_string()
+                config_path: "custom-client.yaml".to_string(),
+                log_format: LogFormat::Plain,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_explicit_config_path() {
+        let command =
+            parse_cli_args(["--config", "configs/client-laptop.yaml"]).expect("parse --config");
+
+        assert_eq!(
+            command,
+            ClientCommand::Run {
+                config_path: "configs/client-laptop.yaml".to_string(),
+                log_format: LogFormat::Plain,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_log_format() {
+        let command = parse_cli_args([
+            "--config",
+            "configs/client-laptop.yaml",
+            "--log-format",
+            "json",
+        ])
+        .expect("parse --log-format");
+
+        assert_eq!(
+            command,
+            ClientCommand::Run {
+                config_path: "configs/client-laptop.yaml".to_string(),
+                log_format: LogFormat::Json,
             }
         );
     }
