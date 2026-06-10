@@ -275,81 +275,86 @@ impl ShroudGuiApp {
             .map(|path| path == config.path.as_path())
             .unwrap_or(false);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let arrow = if is_expanded { "v" } else { ">" };
-
-                if ui.button(arrow).clicked() {
-                    if is_expanded {
-                        self.expanded_config = None;
-                    } else {
-                        self.select_config(index);
-                        self.expanded_config = Some(index);
-                    }
-                }
-
-                let label_response = ui.selectable_label(is_selected, summary);
-                if label_response.clicked() {
-                    if is_expanded {
-                        self.expanded_config = None;
-                    } else {
-                        self.select_config(index);
-                        self.expanded_config = Some(index);
-                    }
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if is_running_config {
-                        if ui.button("Stop").clicked() {
-                            self.stop_client();
-                        }
-                    } else if ui
-                        .add_enabled(
-                            !is_running && self.expanded_config.is_none() && is_valid,
-                            egui::Button::new("Start"),
-                        )
-                        .clicked()
-                    {
-                        self.start_client_config(index);
-                    }
-                });
-            });
-
-            if is_expanded {
-                ui.separator();
-
+        egui::Frame::group(ui.style())
+            .outer_margin(egui::Margin::symmetric(4, 2))
+            .inner_margin(egui::Margin::symmetric(10, 10))
+            .corner_radius(4)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Validate").clicked() {
-                        self.validate_editor();
-                    }
+                    let arrow = if is_expanded { "v" } else { ">" };
 
-                    if ui.button("Save").clicked() {
-                        self.save_selected_config();
-                    }
-
-                    if ui.button("Cancel editing").clicked() {
-                        self.expanded_config = None;
-                        if let Some(config) = self.configs.get(index) {
-                            self.editor_text = config.raw_yaml.clone();
+                    if ui.button(arrow).clicked() {
+                        if is_expanded {
+                            self.expanded_config = None;
+                        } else {
+                            self.select_config(index);
+                            self.expanded_config = Some(index);
                         }
-                        self.status = "editing cancelled".to_string();
                     }
+
+                    let label_response = ui.selectable_label(is_selected, summary);
+                    if label_response.clicked() {
+                        if is_expanded {
+                            self.expanded_config = None;
+                        } else {
+                            self.select_config(index);
+                            self.expanded_config = Some(index);
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if is_running_config {
+                            if ui.button("Stop").clicked() {
+                                self.stop_client();
+                            }
+                        } else if ui
+                            .add_enabled(
+                                !is_running && self.expanded_config.is_none() && is_valid,
+                                egui::Button::new("Start"),
+                            )
+                            .clicked()
+                        {
+                            self.start_client_config(index);
+                        }
+                    });
                 });
 
-                ui.add_sized(
-                    [ui.available_width(), 360.0],
-                    egui::TextEdit::multiline(&mut self.editor_text)
-                        .desired_rows(20)
-                        .code_editor()
-                        .lock_focus(true),
-                );
-            }
-        });
+                if is_expanded {
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Validate").clicked() {
+                            self.validate_editor();
+                        }
+
+                        if ui.button("Save").clicked() {
+                            self.save_selected_config();
+                        }
+
+                        if ui.button("Cancel editing").clicked() {
+                            self.expanded_config = None;
+                            if let Some(config) = self.configs.get(index) {
+                                self.editor_text = config.raw_yaml.clone();
+                            }
+                            self.status = "editing cancelled".to_string();
+                        }
+                    });
+
+                    ui.add_sized(
+                        [ui.available_width(), 360.0],
+                        egui::TextEdit::multiline(&mut self.editor_text)
+                            .desired_rows(20)
+                            .code_editor()
+                            .lock_focus(true),
+                    );
+                }
+            });
     }
 }
 
 impl eframe::App for ShroudGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         let drained_logs = self.logs.drain();
         let is_running = self.client_process.is_running();
         let process_state = self.client_process.state();
@@ -361,7 +366,7 @@ impl eframe::App for ShroudGuiApp {
             ctx.request_repaint();
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Refresh").clicked() {
                     self.refresh_configs();
@@ -373,18 +378,18 @@ impl eframe::App for ShroudGuiApp {
             });
         });
 
-        self.show_import_dialog(ctx);
+        self.show_import_dialog(&ctx);
 
-        egui::TopBottomPanel::bottom("status")
+        egui::Panel::bottom("status")
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(&self.status);
                     ui.label(format!("client: {}", process_state.label()));
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("Configs");
 
             if self.configs.is_empty() {
@@ -392,7 +397,7 @@ impl eframe::App for ShroudGuiApp {
             }
 
             egui::ScrollArea::vertical()
-                .id_source("configs_main_scroll")
+                .id_salt("configs_main_scroll")
                 .auto_shrink([false, false])
                 .max_height(ui.available_height() * 0.65)
                 .show(ui, |ui| {
@@ -409,7 +414,7 @@ impl eframe::App for ShroudGuiApp {
             let log_text = self.logs.text();
 
             egui::ScrollArea::vertical()
-                .id_source("client_logs_scroll")
+                .id_salt("client_logs_scroll")
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .max_height(ui.available_height())
