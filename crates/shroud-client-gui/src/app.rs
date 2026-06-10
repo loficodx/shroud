@@ -238,6 +238,7 @@ impl ShroudGuiApp {
 
         let path = config.path.clone();
         self.select_config(index);
+        self.logs.clear();
 
         match self.client_process.start(&path, self.logs.sender()) {
             Ok(()) => {
@@ -399,6 +400,11 @@ impl eframe::App for ShroudGuiApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Client logs");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Clear log").clicked() {
+                            self.logs.clear();
+                        }
+                    });
                 });
 
                 ui.separator();

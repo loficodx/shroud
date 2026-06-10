@@ -51,6 +51,11 @@ impl LogBuffer {
         drained
     }
 
+    pub fn clear(&mut self) {
+        while self.receiver.try_recv().is_ok() {}
+        self.lines.clear();
+    }
+
     pub fn text(&self) -> String {
         self.lines
             .iter()
@@ -85,5 +90,19 @@ mod tests {
 
         assert_eq!(logs.drain(), 5);
         assert_eq!(logs.text(), "line 2\nline 3\nline 4");
+    }
+
+    #[test]
+    fn clear_removes_rendered_and_pending_lines() {
+        let mut logs = LogBuffer::with_max_lines(10);
+
+        logs.push("rendered");
+        logs.drain();
+        logs.push("pending");
+
+        logs.clear();
+
+        assert_eq!(logs.drain(), 0);
+        assert_eq!(logs.text(), "");
     }
 }
