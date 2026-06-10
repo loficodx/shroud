@@ -10,10 +10,11 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
 
 ### Implemented
 
-- Rust workspace with three crates:
+- Rust workspace with four crates:
   - `shroud-core` - shared config, auth, legacy frame helpers, and `raw_tcp` handshake types;
   - `shroud-client` - local SOCKS5/TUN client, routing, DNS policy checks, and outbound transport;
-  - `shroud-server` - TLS listener, `raw_tcp` authentication, target ACL checks, TCP relay, and legacy HTTP/static handler code.
+  - `shroud-server` - TLS listener, `raw_tcp` authentication, target ACL checks, TCP relay, and legacy HTTP/static handler code;
+  - `shroud-client-gui` - native egui client launcher/config editor for discovered client YAML files.
 - Client inbounds:
   - SOCKS5 no-auth handshake;
   - SOCKS5 `CONNECT` for IPv4, IPv6, and domain targets;
@@ -53,6 +54,11 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
   - static fallback from `web_root`;
   - neutral 403/404 responses;
   - note: with the current valid `transport.modes: [raw_tcp]` server mode, non-`raw_tcp` connections are rejected before the HTTP handler is reached.
+- Client GUI:
+  - discovers `client*.yaml` in the repository root and `configs/client*.yaml`;
+  - validates client configs before saving or starting;
+  - imports `shrd:1:...` connection strings into client YAML files;
+  - starts/stops `shroud-client` and displays JSON-formatted client logs.
 - TUN mode:
   - Linux TUN device creation through `/dev/net/tun`;
   - no packet information header (`IFF_NO_PI`);
@@ -74,6 +80,7 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
   - DNS policy test;
   - rejected SOCKS UDP ASSOCIATE test;
   - server web handler unit tests;
+  - client GUI config discovery/import/process unit tests;
   - ignored Linux TUN smoke test.
 
 ### Not Implemented Or Not Active
@@ -118,14 +125,14 @@ Workspace layout:
 ├── Cargo.toml
 ├── configs/
 │   ├── client.yaml
-│   ├── client-remote.yaml
 │   └── server.yaml
 ├── certs/
 │   └── README.md
 ├── crates/
 │   ├── shroud-core/
 │   ├── shroud-client/
-│   └── shroud-server/
+│   ├── shroud-server/
+│   └── shroud-client-gui/
 ├── scripts/
 │   ├── generate-certs.sh
 │   └── tun-smoke-linux.sh
@@ -141,6 +148,7 @@ Workspace layout:
 - `cargo`.
 - `curl` for manual smoke checks.
 - Docker / Docker Compose if running the server in a container.
+- A desktop/display environment if running `shroud-client-gui`.
 - Linux for TUN mode.
 - Root privileges for TUN smoke tests.
 - Linux tools for TUN smoke tests:
@@ -351,12 +359,26 @@ Start the client:
 cargo run -p shroud-client -- configs/client.yaml
 ```
 
+The client also accepts `--config` and JSON log output:
+
+```bash
+cargo run -p shroud-client -- --config configs/client.yaml --log-format json
+```
+
 Both binaries use default config paths when no config argument is provided:
 
 ```bash
 cargo run -p shroud-server
 cargo run -p shroud-client
 ```
+
+Start the native client GUI:
+
+```bash
+cargo run -p shroud-client-gui
+```
+
+The GUI discovers `client*.yaml` and `configs/client*.yaml`, validates configs with the same loader as `shroud-client`, can import `shrd:1:...` strings, and starts `shroud-client` from a sibling binary path or from `PATH`.
 
 ## SOCKS5 Smoke Test
 
