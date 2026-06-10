@@ -359,9 +359,11 @@ impl eframe::App for ShroudGuiApp {
         let is_running = self.client_process.is_running();
         let process_state = self.client_process.state();
         let running_config_path = self.client_process.running_config_path();
+
         if is_running {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+
         if drained_logs > 0 {
             ctx.request_repaint();
         }
@@ -389,6 +391,32 @@ impl eframe::App for ShroudGuiApp {
                 });
             });
 
+        egui::Panel::bottom("client_logs_panel")
+            .resizable(true)
+            .default_size(220.0)
+            .min_size(80.0)
+            .max_size(500.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Client logs");
+                });
+
+                ui.separator();
+
+                let log_text = self.logs.text();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("client_logs_scroll")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(log_text).monospace())
+                                .selectable(true),
+                        );
+                    });
+            });
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("Configs");
 
@@ -399,30 +427,11 @@ impl eframe::App for ShroudGuiApp {
             egui::ScrollArea::vertical()
                 .id_salt("configs_main_scroll")
                 .auto_shrink([false, false])
-                .max_height(ui.available_height() * 0.65)
                 .show(ui, |ui| {
                     for index in 0..self.configs.len() {
                         self.show_config_row(ui, index, is_running, running_config_path.as_deref());
                         ui.add_space(6.0);
                     }
-                });
-
-            ui.separator();
-
-            ui.heading("Client logs");
-
-            let log_text = self.logs.text();
-
-            egui::ScrollArea::vertical()
-                .id_salt("client_logs_scroll")
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(log_text).monospace())
-                            .selectable(true),
-                    );
                 });
         });
     }
