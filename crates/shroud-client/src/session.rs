@@ -208,21 +208,6 @@ pub struct RelayStats {
     pub upstream_to_client_bytes: u64,
 }
 
-impl RelayStats {
-    pub fn total_bytes(self) -> u64 {
-        self.client_to_upstream_bytes + self.upstream_to_client_bytes
-    }
-
-    pub fn mbps(self, elapsed: Duration) -> f64 {
-        let seconds = elapsed.as_secs_f64();
-        if seconds > 0.0 {
-            (self.total_bytes() as f64 * 8.0) / seconds / 1_000_000.0
-        } else {
-            0.0
-        }
-    }
-}
-
 impl From<TcpTransportMetrics> for TcpOpenMetrics {
     fn from(metrics: TcpTransportMetrics) -> Self {
         Self {

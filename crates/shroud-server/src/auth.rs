@@ -71,7 +71,6 @@ fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::auth::compute_auth_tag;
 
     const CLIENT_ID: &str = "11111111-1111-1111-1111-111111111111";
     const CLIENT_SECRET: &str = "test-secret";
@@ -85,12 +84,22 @@ mod tests {
         }]
     }
 
+    fn compute_auth_tag(
+        client_secret: &[u8],
+        nonce: &[u8],
+        timestamp: i64,
+        client_id: &str,
+    ) -> String {
+        let tag = compute_auth_tag_bytes(client_secret, nonce, timestamp, client_id)
+            .expect("compute tag");
+        STANDARD_NO_PAD.encode(tag)
+    }
+
     #[test]
     fn validates_correct_hmac() {
         let nonce = [7u8; 16];
         let timestamp = 1_800_000_000;
-        let tag = compute_auth_tag(CLIENT_SECRET.as_bytes(), &nonce, timestamp, CLIENT_ID)
-            .expect("compute tag");
+        let tag = compute_auth_tag(CLIENT_SECRET.as_bytes(), &nonce, timestamp, CLIENT_ID);
 
         assert!(validate_auth(
             &clients(),
@@ -116,8 +125,7 @@ mod tests {
     fn rejects_wrong_hmac() {
         let nonce = [7u8; 16];
         let timestamp = 1_800_000_000;
-        let tag =
-            compute_auth_tag(b"wrong-secret", &nonce, timestamp, CLIENT_ID).expect("compute tag");
+        let tag = compute_auth_tag(b"wrong-secret", &nonce, timestamp, CLIENT_ID);
 
         assert!(!validate_auth(
             &clients(),

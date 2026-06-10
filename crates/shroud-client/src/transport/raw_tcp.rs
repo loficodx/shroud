@@ -37,10 +37,6 @@ struct RawTcpClientTimeouts {
 }
 
 impl RawTcpTransport {
-    pub fn new(outbound: OutboundConfig, auth: ClientAuthConfig) -> Result<Self> {
-        Self::with_timeouts(outbound, auth, TimeoutsConfig::default())
-    }
-
     pub fn with_timeouts(
         outbound: OutboundConfig,
         auth: ClientAuthConfig,
@@ -110,16 +106,6 @@ impl TcpTransport for RawTcpTransport {
     ) -> BoxFuture<'a, Result<TcpTransportConnect>> {
         Box::pin(async move { self.open_tcp(target_host, target_port).await })
     }
-}
-
-pub async fn connect_raw_tcp(
-    outbound: &OutboundConfig,
-    auth: &ClientAuthConfig,
-    target_host: &str,
-    target_port: u16,
-) -> Result<TcpTransportConnect> {
-    let transport = RawTcpTransport::new(outbound.clone(), auth.clone())?;
-    transport.open_tcp(target_host, target_port).await
 }
 
 async fn connect_raw_tcp_with_cached_tls(
@@ -275,7 +261,9 @@ mod tests {
         outbound.server = "localhost".to_string();
         outbound.tls = true;
 
-        let transport = RawTcpTransport::new(outbound, auth_config()).unwrap();
+        let transport =
+            RawTcpTransport::with_timeouts(outbound, auth_config(), TimeoutsConfig::default())
+                .unwrap();
 
         assert!(transport.tls.is_some());
     }
@@ -289,7 +277,11 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
 
-        let err = match RawTcpTransport::new(outbound, auth_config()) {
+        let err = match RawTcpTransport::with_timeouts(
+            outbound,
+            auth_config(),
+            TimeoutsConfig::default(),
+        ) {
             Ok(_) => panic!("raw_tcp transport unexpectedly accepted missing CA file"),
             Err(err) => err,
         };
@@ -327,10 +319,13 @@ mod tests {
             socket.write_all(b"pong").await.unwrap();
         });
 
-        let mut connected =
-            connect_raw_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
-                .await
-                .unwrap();
+        let transport = RawTcpTransport::with_timeouts(
+            outbound_config(port),
+            auth_config(),
+            TimeoutsConfig::default(),
+        )
+        .unwrap();
+        let mut connected = transport.connect("example.com", 443).await.unwrap();
         assert!(connected.metrics.server_tcp_connect_ms.is_some());
         assert!(connected.metrics.raw_tcp_handshake_ms.is_some());
         connected.stream.write_all(b"ping").await.unwrap();
@@ -355,9 +350,13 @@ mod tests {
                 .unwrap();
         });
 
-        let err = match connect_raw_tcp(&outbound_config(port), &auth_config(), "example.com", 443)
-            .await
-        {
+        let transport = RawTcpTransport::with_timeouts(
+            outbound_config(port),
+            auth_config(),
+            TimeoutsConfig::default(),
+        )
+        .unwrap();
+        let err = match transport.connect("example.com", 443).await {
             Ok(_) => panic!("raw_tcp connect unexpectedly succeeded"),
             Err(err) => err,
         };

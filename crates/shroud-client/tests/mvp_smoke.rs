@@ -2,7 +2,8 @@ use shroud_client::routing::Router;
 use shroud_client::session::SessionCore;
 use shroud_client::socks5;
 use shroud_client::transport;
-use shroud_client::transport::raw_tcp::connect_raw_tcp;
+use shroud_client::transport::TcpTransport;
+use shroud_client::transport::raw_tcp::RawTcpTransport;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
     RoutingConfig, RoutingRule, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
@@ -209,14 +210,12 @@ async fn target_connect_failure_becomes_socks_general_failure() -> TestResult {
 async fn tunnel_rejects_bad_auth() -> TestResult {
     let server = start_tunnel_server().await?;
 
-    let err = match connect_raw_tcp(
-        &outbound_config(server.addr, "/api/tunnel"),
-        &auth_config("wrong-secret"),
-        "127.0.0.1",
-        1,
-    )
-    .await
-    {
+    let transport = RawTcpTransport::with_timeouts(
+        outbound_config(server.addr, "/api/tunnel"),
+        auth_config("wrong-secret"),
+        TimeoutsConfig::default(),
+    )?;
+    let err = match transport.connect("127.0.0.1", 1).await {
         Ok(_) => panic!("raw_tcp unexpectedly accepted invalid auth"),
         Err(err) => err,
     };
@@ -233,13 +232,12 @@ async fn raw_tcp_pinned_tls_tunnel_relays_to_target() -> TestResult {
     let target = start_exact_echo_target(4).await?;
     let server = start_tunnel_server().await?;
 
-    let mut connected = connect_raw_tcp(
-        &pinned_outbound_config(server.addr, "/api/tunnel", SERVER_CERT_SHA256),
-        &auth_config(CLIENT_SECRET),
-        "127.0.0.1",
-        target.addr.port(),
-    )
-    .await?;
+    let transport = RawTcpTransport::with_timeouts(
+        pinned_outbound_config(server.addr, "/api/tunnel", SERVER_CERT_SHA256),
+        auth_config(CLIENT_SECRET),
+        TimeoutsConfig::default(),
+    )?;
+    let mut connected = transport.connect("127.0.0.1", target.addr.port()).await?;
 
     connected.stream.write_all(b"ping").await?;
     let mut response = [0u8; 4];
@@ -254,14 +252,12 @@ async fn raw_tcp_pinned_tls_rejects_cert_pin_mismatch() -> TestResult {
     let server = start_tunnel_server().await?;
     let wrong_pin = "1111111111111111111111111111111111111111111111111111111111111111";
 
-    let err = match connect_raw_tcp(
-        &pinned_outbound_config(server.addr, "/api/tunnel", wrong_pin),
-        &auth_config(CLIENT_SECRET),
-        "127.0.0.1",
-        1,
-    )
-    .await
-    {
+    let transport = RawTcpTransport::with_timeouts(
+        pinned_outbound_config(server.addr, "/api/tunnel", wrong_pin),
+        auth_config(CLIENT_SECRET),
+        TimeoutsConfig::default(),
+    )?;
+    let err = match transport.connect("127.0.0.1", 1).await {
         Ok(_) => panic!("raw_tcp unexpectedly accepted wrong server certificate pin"),
         Err(err) => err,
     };

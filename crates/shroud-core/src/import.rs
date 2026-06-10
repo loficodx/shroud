@@ -1,7 +1,7 @@
 use crate::config::{
-    ClientAuthConfig, ClientConfig, ClientDnsConfig, ClientInboundsConfig, LimitsConfig,
-    LoggingConfig, RelayConfig, RoutingConfig, SocksInboundConfig, TimeoutsConfig, TransportConfig,
-    TransportMode, TunInboundConfig,
+    ClientAuthConfig, ClientDnsConfig, ClientInboundsConfig, LimitsConfig, LoggingConfig,
+    RelayConfig, RoutingConfig, SocksInboundConfig, TimeoutsConfig, TransportConfig, TransportMode,
+    TunInboundConfig,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -50,10 +50,6 @@ pub fn decode_import_connection(raw: &str) -> Result<ImportConnection> {
         .decode(encoded)
         .context("failed to decode import payload")?;
     serde_json::from_slice(&json).context("failed to parse import payload")
-}
-
-pub fn client_config_from_import(conn: ImportConnection) -> ClientConfig {
-    ClientConfig::default_for_import(conn)
 }
 
 pub fn render_client_yaml_from_import(conn: ImportConnection) -> Result<String> {
@@ -111,7 +107,7 @@ impl From<ImportConnection> for ImportClientYaml {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{load_client_config_yaml, validate_client_config};
+    use crate::config::load_client_config_yaml;
 
     fn sample_import() -> ImportConnection {
         ImportConnection {
@@ -173,9 +169,9 @@ mod tests {
 
     #[test]
     fn builds_valid_client_config_from_import() {
-        let config = client_config_from_import(sample_import());
+        let yaml = render_client_yaml_from_import(sample_import()).expect("render yaml");
+        let config = load_client_config_yaml(&yaml).expect("generated yaml is valid");
 
-        validate_client_config(&config).expect("valid generated config");
         assert_eq!(config.transport.server, "138.124.55.220");
         assert_eq!(config.transport.port, 8443);
         assert_eq!(

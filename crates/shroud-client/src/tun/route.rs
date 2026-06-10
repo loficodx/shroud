@@ -6,7 +6,7 @@ use std::process::Command;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteCommand {
+struct RouteCommand {
     program: String,
     args: Vec<String>,
 }
@@ -19,15 +19,7 @@ impl RouteCommand {
         }
     }
 
-    pub fn program(&self) -> &str {
-        &self.program
-    }
-
-    pub fn args(&self) -> &[String] {
-        &self.args
-    }
-
-    pub fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<()> {
         let output = Command::new(&self.program)
             .args(&self.args)
             .output()
@@ -53,15 +45,15 @@ impl fmt::Display for RouteCommand {
 }
 
 #[derive(Debug, Clone)]
-pub struct RoutePlan {
-    pub interface: Vec<RouteCommand>,
-    pub loop_protection: Vec<RouteCommand>,
-    pub default_route: Vec<RouteCommand>,
-    pub cleanup: Vec<RouteCommand>,
+struct RoutePlan {
+    interface: Vec<RouteCommand>,
+    loop_protection: Vec<RouteCommand>,
+    default_route: Vec<RouteCommand>,
+    cleanup: Vec<RouteCommand>,
 }
 
 impl RoutePlan {
-    pub fn build(
+    fn build(
         tun_name: &str,
         tun: &TunInboundConfig,
         endpoint_route: Option<EndpointRoute>,
@@ -108,19 +100,19 @@ impl RoutePlan {
         })
     }
 
-    pub fn apply_interface(&self) -> Result<()> {
+    fn apply_interface(&self) -> Result<()> {
         run_all(&self.interface)
     }
 
-    pub fn apply_loop_protection(&self) -> Result<()> {
+    fn apply_loop_protection(&self) -> Result<()> {
         run_all(&self.loop_protection)
     }
 
-    pub fn apply_default_route(&self) -> Result<()> {
+    fn apply_default_route(&self) -> Result<()> {
         run_all(&self.default_route)
     }
 
-    pub fn log(&self) {
+    fn log(&self) {
         for command in &self.interface {
             debug!(command = %command, "TUN interface setup command planned");
         }
@@ -154,14 +146,14 @@ impl Drop for TunRouteGuard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EndpointRoute {
-    pub endpoint: IpAddr,
-    pub via: Option<IpAddr>,
-    pub dev: String,
+struct EndpointRoute {
+    endpoint: IpAddr,
+    via: Option<IpAddr>,
+    dev: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefaultRoute {
+struct DefaultRoute {
     tokens: Vec<String>,
 }
 
@@ -173,18 +165,13 @@ impl DefaultRoute {
     }
 }
 
-pub fn setup_interface_only(tun_name: &str, tun: &TunInboundConfig) -> Result<()> {
-    let plan = RoutePlan::build(tun_name, tun, None, &[])?;
-    plan.apply_interface()
+struct ResolvedEndpoint {
+    ip: IpAddr,
+    original_host: String,
+    was_hostname: bool,
 }
 
-pub struct ResolvedEndpoint {
-    pub ip: IpAddr,
-    pub original_host: String,
-    pub was_hostname: bool,
-}
-
-pub fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<ResolvedEndpoint> {
+fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<ResolvedEndpoint> {
     let original_host = outbound.server.clone();
 
     if let Ok(ip) = outbound.server.parse::<IpAddr>() {
@@ -237,7 +224,7 @@ pub fn prepare_auto_route_outbound(mut outbound: OutboundConfig) -> Result<Outbo
     Ok(outbound)
 }
 
-pub fn resolve_endpoint_route(endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
+fn resolve_endpoint_route(endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
     platform::resolve_endpoint_route(endpoint)
 }
 

@@ -105,48 +105,6 @@ impl ClientConfig {
     pub fn transport_compat_warnings(&self) -> &[String] {
         &self.transport_compat_warnings
     }
-
-    pub fn default_for_import(conn: crate::import::ImportConnection) -> Self {
-        let transport = TransportConfig {
-            mode: conn.mode,
-            server: conn.server,
-            port: conn.port,
-            tls: conn.tls,
-            tls_server_name: conn.tls_server_name,
-            tls_ca_cert_path: None,
-            tls_server_cert_sha256: Some(conn.tls_server_cert_sha256),
-            path: None,
-        };
-        let outbound = OutboundConfig::from_transport(&transport);
-
-        Self {
-            inbound: Some(SocksInboundConfig {
-                enabled: true,
-                listen: SocketAddr::from(([127, 0, 0, 1], 1080)),
-            }),
-            inbounds: ClientInboundsConfig {
-                socks: Some(SocksInboundConfig {
-                    enabled: true,
-                    listen: SocketAddr::from(([127, 0, 0, 1], 1080)),
-                }),
-                tun: TunInboundConfig::default(),
-            },
-            transport,
-            outbound,
-            auth: ClientAuthConfig {
-                client_id: conn.client_id,
-                client_secret: conn.client_secret,
-            },
-            timeouts: TimeoutsConfig::default(),
-            relay: RelayConfig::default(),
-            limits: LimitsConfig::default(),
-            routing: RoutingConfig::default(),
-            dns: ClientDnsConfig::default(),
-            logging: LoggingConfig::default(),
-            transport_source: TransportConfigSource::Transport,
-            transport_compat_warnings: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

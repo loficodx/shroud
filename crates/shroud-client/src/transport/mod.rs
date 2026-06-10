@@ -1,7 +1,5 @@
-pub mod http2;
-pub mod http3;
 pub mod raw_tcp;
-pub mod tls;
+pub(crate) mod tls;
 
 use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
