@@ -18,6 +18,7 @@ pub struct ClientConfig {
     pub limits: LimitsConfig,
     pub routing: RoutingConfig,
     pub dns: ClientDnsConfig,
+    pub logging: LoggingConfig,
     #[serde(skip_serializing)]
     transport_source: TransportConfigSource,
     #[serde(skip_serializing)]
@@ -80,6 +81,7 @@ impl<'de> Deserialize<'de> for ClientConfig {
         let limits = raw.limits.unwrap_or_default();
         let routing = raw.routing.unwrap_or_default();
         let dns = raw.dns.unwrap_or_default();
+        let logging = raw.logging.unwrap_or_default();
 
         Ok(Self {
             inbound,
@@ -92,6 +94,7 @@ impl<'de> Deserialize<'de> for ClientConfig {
             limits,
             routing,
             dns,
+            logging,
             transport_source,
             transport_compat_warnings,
         })
@@ -139,6 +142,7 @@ impl ClientConfig {
             limits: LimitsConfig::default(),
             routing: RoutingConfig::default(),
             dns: ClientDnsConfig::default(),
+            logging: LoggingConfig::default(),
             transport_source: TransportConfigSource::Transport,
             transport_compat_warnings: Vec::new(),
         }
@@ -337,6 +341,20 @@ impl Default for RelayConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
@@ -401,6 +419,10 @@ fn default_max_concurrent_connections() -> usize {
 
 fn default_relay_buffer_size() -> usize {
     64 * 1024
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
@@ -514,6 +536,8 @@ pub struct ServerConfig {
     pub tunnel_path: String,
     #[serde(default)]
     pub web_root: String,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
     #[serde(default)]
@@ -720,6 +744,7 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_routing_config_into(&mut errors, "routing.rules", &config.routing);
+    validate_logging_config(&mut errors, "logging", &config.logging);
 
     finish_validation(errors)
 }
@@ -780,6 +805,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_server_security_config(&mut errors, "security", &config.security);
+    validate_logging_config(&mut errors, "logging", &config.logging);
 
     finish_validation(errors)
 }
@@ -839,6 +865,20 @@ fn validate_relay_config(errors: &mut Vec<ConfigFieldError>, base_path: &str, re
         &format!("{base_path}.download_buffer_size"),
         relay.download_buffer_size,
     );
+}
+
+fn validate_logging_config(
+    errors: &mut Vec<ConfigFieldError>,
+    base_path: &str,
+    logging: &LoggingConfig,
+) {
+    match logging.level.trim().to_ascii_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" | "off" => {}
+        _ => errors.push(ConfigFieldError::new(
+            format!("{base_path}.level"),
+            "must be one of trace, debug, info, warn, error, or off",
+        )),
+    }
 }
 
 pub fn validate_routing_config(config: &RoutingConfig) -> Result<(), ConfigValidationError> {
@@ -1203,6 +1243,8 @@ struct ClientConfigRaw {
     routing: Option<RoutingConfig>,
     #[serde(default)]
     dns: Option<ClientDnsConfig>,
+    #[serde(default)]
+    logging: Option<LoggingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1312,6 +1354,25 @@ transport:
         assert_eq!(cfg.relay.upload_buffer_size, 65_536);
         assert_eq!(cfg.relay.download_buffer_size, 65_536);
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
+        assert_eq!(cfg.logging.level, "info");
+    }
+
+    #[test]
+    fn client_config_accepts_logging_level_override() {
+        let raw = format!("{BASE_CLIENT_TRANSPORT_CONFIG}\nlogging:\n  level: debug\n");
+
+        let cfg = load_client_config_yaml(&raw).expect("valid config");
+
+        assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_logging_level() {
+        let raw = format!("{BASE_CLIENT_TRANSPORT_CONFIG}\nlogging:\n  level: verbose\n");
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("logging.level"));
     }
 
     #[test]
@@ -1540,6 +1601,43 @@ clients:
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
         assert!(cfg.security.deny_private_ips);
         assert!(cfg.security.allow_ports.is_empty());
+        assert_eq!(cfg.logging.level, "info");
+    }
+
+    #[test]
+    fn server_config_accepts_logging_level_override() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+logging:
+  level: warn
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert_eq!(cfg.logging.level, "warn");
+    }
+
+    #[test]
+    fn server_config_rejects_invalid_logging_level() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+logging:
+  level: verbose
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("logging.level"));
     }
 
     #[test]

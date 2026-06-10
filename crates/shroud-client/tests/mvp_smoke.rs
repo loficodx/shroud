@@ -405,6 +405,7 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
         listen: addr,
         tunnel_path: "/api/tunnel".to_string(),
         web_root: "./web".to_string(),
+        logging: Default::default(),
         transport: Default::default(),
         tls: ServerTlsConfig {
             enabled: true,

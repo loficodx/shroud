@@ -1,5 +1,6 @@
-use anyhow::{Context, Result, anyhow, bail};
-use shroud_core::config::{generate_client_credentials, load_server_config_yaml};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use shroud_core::config::{LoggingConfig, load_server_config_yaml};
 use shroud_server::{setup, web};
 use std::fs;
 use std::path::PathBuf;
@@ -12,16 +13,35 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    match Cli::parse().into_command() {
+        ServerCommand::Run { config_path } => run_server(config_path).await,
+        ServerCommand::GenerateCerts(options) => {
+            init_tracing(&LoggingConfig::default());
+            let output = setup::run_generate_certs(options)?;
+            setup::print_generate_certs_output(&output);
+            Ok(())
+        }
+        ServerCommand::AddClient(options) => {
+            init_tracing(&LoggingConfig::default());
+            let output = setup::run_add_client(options)?;
+            setup::print_add_client_output(&output);
+            Ok(())
+        }
+        ServerCommand::ClientList(options) => {
+            init_tracing(&LoggingConfig::default());
+            let output = setup::run_client_list(options)?;
+            setup::print_client_list_output(&output);
+            Ok(())
+        }
+    }
+}
 
-    let Some(config_path) = parse_cli()? else {
-        return Ok(());
-    };
+async fn run_server(config_path: PathBuf) -> Result<()> {
     let raw = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read server config: {config_path}"))?;
+        .with_context(|| format!("failed to read server config: {}", config_path.display()))?;
     let cfg = load_server_config_yaml(&raw)
-        .with_context(|| format!("failed to load server config: {config_path}"))?;
+        .with_context(|| format!("failed to load server config: {}", config_path.display()))?;
+    init_tracing(&cfg.logging);
 
     info!(
         listen = %cfg.listen,
@@ -31,234 +51,236 @@ async fn main() -> Result<()> {
     web::serve(cfg).await
 }
 
-fn parse_cli() -> Result<Option<String>> {
-    let mut args = std::env::args().skip(1);
-    let first = args.next();
+fn init_tracing(logging: &LoggingConfig) {
+    let filter = EnvFilter::new(logging.level.trim());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
-    match first.as_deref() {
-        Some("generate-certs") => {
-            let rest = args.collect::<Vec<_>>();
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_generate_certs_usage();
-                return Ok(None);
+#[derive(Debug, Parser)]
+#[command(name = "shroud-server")]
+struct Cli {
+    #[arg(value_name = "config-path")]
+    config_path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<ServerSubcommand>,
+}
+
+#[derive(Debug)]
+enum ServerCommand {
+    Run { config_path: PathBuf },
+    GenerateCerts(setup::GenerateCertsOptions),
+    AddClient(setup::AddClientOptions),
+    ClientList(setup::ClientListOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerSubcommand {
+    GenerateCerts(GenerateCertsArgs),
+    AddClient(AddClientArgs),
+    #[command(name = "client-list", alias = "list-clients")]
+    ClientList(ClientListArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct GenerateCertsArgs {
+    #[arg(long = "server", value_name = "host-or-ip")]
+    server: String,
+
+    #[arg(
+        long = "config",
+        value_name = "path",
+        default_value = "configs/server.yaml"
+    )]
+    config_path: PathBuf,
+
+    #[arg(long = "cert-dir", value_name = "path", default_value = "certs")]
+    cert_dir: PathBuf,
+
+    #[arg(long = "force")]
+    force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct AddClientArgs {
+    #[arg(long = "name", value_name = "name")]
+    name: String,
+
+    #[arg(long = "server", value_name = "host-or-ip")]
+    server: String,
+
+    #[arg(long = "port", value_name = "port")]
+    port: Option<u16>,
+
+    #[arg(
+        long = "config",
+        value_name = "path",
+        default_value = "configs/server.yaml"
+    )]
+    config_path: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+struct ClientListArgs {
+    #[arg(long = "server", value_name = "host-or-ip")]
+    server: String,
+
+    #[arg(long = "port", value_name = "port")]
+    port: Option<u16>,
+
+    #[arg(
+        long = "config",
+        value_name = "path",
+        default_value = "configs/server.yaml"
+    )]
+    config_path: PathBuf,
+}
+
+impl Cli {
+    fn into_command(self) -> ServerCommand {
+        match self.command {
+            Some(ServerSubcommand::GenerateCerts(args)) => {
+                ServerCommand::GenerateCerts(setup::GenerateCertsOptions {
+                    server: Some(args.server),
+                    config_path: args.config_path,
+                    cert_dir: args.cert_dir,
+                    force: args.force,
+                })
             }
-            let options = parse_generate_certs_args(rest.into_iter())?;
-            let output = setup::run_generate_certs(options)?;
-            setup::print_generate_certs_output(&output);
-            Ok(None)
-        }
-        Some("add-client") => {
-            let rest = args.collect::<Vec<_>>();
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_add_client_usage();
-                return Ok(None);
+            Some(ServerSubcommand::AddClient(args)) => {
+                ServerCommand::AddClient(setup::AddClientOptions {
+                    name: Some(args.name),
+                    server: args.server,
+                    port: args.port,
+                    config_path: args.config_path,
+                })
             }
-            let options = parse_add_client_args(rest.into_iter())?;
-            let output = setup::run_add_client(options)?;
-            setup::print_add_client_output(&output);
-            Ok(None)
-        }
-        Some("client-list") | Some("list-clients") => {
-            let rest = args.collect::<Vec<_>>();
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_client_list_usage();
-                return Ok(None);
+            Some(ServerSubcommand::ClientList(args)) => {
+                ServerCommand::ClientList(setup::ClientListOptions {
+                    server: args.server,
+                    port: args.port,
+                    config_path: args.config_path,
+                })
             }
-            let options = parse_client_list_args(rest.into_iter())?;
-            let output = setup::run_client_list(options)?;
-            setup::print_client_list_output(&output);
-            Ok(None)
+            None => ServerCommand::Run {
+                config_path: self
+                    .config_path
+                    .unwrap_or_else(|| PathBuf::from("configs/server.yaml")),
+            },
         }
-        Some("setup") | Some("init") => {
-            let rest = args.collect::<Vec<_>>();
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_setup_usage();
-                return Ok(None);
-            }
-            let options = parse_setup_args(rest.into_iter())?;
-            let output = setup::run_setup(options)?;
-            setup::print_client_snippet(&output);
-            Ok(None)
-        }
-        Some("generate-credentials") | Some("gen-credentials") => {
-            let credentials = generate_client_credentials();
-            println!("client_id: \"{}\"", credentials.client_id);
-            println!("client_secret: \"{}\"", credentials.client_secret);
-            Ok(None)
-        }
-        _ => Ok(Some(
-            first.unwrap_or_else(|| "configs/server.yaml".to_string()),
-        )),
     }
 }
 
-fn parse_setup_args(mut args: impl Iterator<Item = String>) -> Result<setup::SetupOptions> {
-    let mut server = None;
-    let mut port = None;
-    let mut name = None;
-    let mut config_path = PathBuf::from("configs/server.yaml");
-    let mut cert_dir = PathBuf::from("certs");
-    let mut force_certs = false;
-    let mut force_client = false;
+#[cfg(test)]
+mod tests {
+    use super::{Cli, ServerCommand};
+    use clap::Parser;
+    use std::path::PathBuf;
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--server" => server = Some(next_arg(&mut args, "--server")?),
-            "--name" => name = Some(next_arg(&mut args, "--name")?),
-            "--port" => {
-                let raw = next_arg(&mut args, "--port")?;
-                port = Some(
-                    raw.parse::<u16>()
-                        .with_context(|| format!("invalid --port value: {raw}"))?,
+    #[test]
+    fn parse_cli_defaults_to_sample_server_config() {
+        let command = Cli::try_parse_from(["shroud-server"])
+            .expect("parse default config")
+            .into_command();
+
+        match command {
+            ServerCommand::Run { config_path } => {
+                assert_eq!(config_path, PathBuf::from("configs/server.yaml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_accepts_server_config_path() {
+        let command = Cli::try_parse_from(["shroud-server", "custom-server.yaml"])
+            .expect("parse custom config")
+            .into_command();
+
+        match command {
+            ServerCommand::Run { config_path } => {
+                assert_eq!(config_path, PathBuf::from("custom-server.yaml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_accepts_generate_certs_command() {
+        let command = Cli::try_parse_from([
+            "shroud-server",
+            "generate-certs",
+            "--server",
+            "127.0.0.1",
+            "--config",
+            "configs/server-lab.yaml",
+            "--cert-dir",
+            "tmp-certs",
+            "--force",
+        ])
+        .expect("parse generate-certs")
+        .into_command();
+
+        match command {
+            ServerCommand::GenerateCerts(options) => {
+                assert_eq!(options.server.as_deref(), Some("127.0.0.1"));
+                assert_eq!(
+                    options.config_path,
+                    PathBuf::from("configs/server-lab.yaml")
                 );
+                assert_eq!(options.cert_dir, PathBuf::from("tmp-certs"));
+                assert!(options.force);
             }
-            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
-            "--cert-dir" => cert_dir = PathBuf::from(next_arg(&mut args, "--cert-dir")?),
-            "--force-certs" => force_certs = true,
-            "--force-client" => force_client = true,
-            unknown => bail!("unknown setup option: {unknown}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
-    Ok(setup::SetupOptions {
-        server: server.ok_or_else(|| anyhow!("setup requires --server <host-or-ip>"))?,
-        port: port.ok_or_else(|| anyhow!("setup requires --port <port>"))?,
-        name,
-        config_path,
-        cert_dir,
-        force_certs,
-        force_client,
-    })
-}
+    #[test]
+    fn parse_cli_accepts_add_client_command() {
+        let command = Cli::try_parse_from([
+            "shroud-server",
+            "add-client",
+            "--name",
+            "laptop",
+            "--server",
+            "panel.example.com",
+            "--port",
+            "9443",
+        ])
+        .expect("parse add-client")
+        .into_command();
 
-fn parse_generate_certs_args(
-    mut args: impl Iterator<Item = String>,
-) -> Result<setup::GenerateCertsOptions> {
-    let mut server = None;
-    let mut config_path = PathBuf::from("configs/server.yaml");
-    let mut cert_dir = PathBuf::from("certs");
-    let mut force = false;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--server" => server = Some(next_arg(&mut args, "--server")?),
-            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
-            "--cert-dir" => cert_dir = PathBuf::from(next_arg(&mut args, "--cert-dir")?),
-            "--force" => force = true,
-            unknown => bail!("unknown generate-certs option: {unknown}"),
-        }
-    }
-
-    Ok(setup::GenerateCertsOptions {
-        server,
-        config_path,
-        cert_dir,
-        force,
-    })
-}
-
-fn parse_add_client_args(
-    mut args: impl Iterator<Item = String>,
-) -> Result<setup::AddClientOptions> {
-    let mut name = None;
-    let mut server = None;
-    let mut port = None;
-    let mut config_path = PathBuf::from("configs/server.yaml");
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--name" => name = Some(next_arg(&mut args, "--name")?),
-            "--server" => server = Some(next_arg(&mut args, "--server")?),
-            "--port" => {
-                let raw = next_arg(&mut args, "--port")?;
-                port = Some(
-                    raw.parse::<u16>()
-                        .with_context(|| format!("invalid --port value: {raw}"))?,
-                );
+        match command {
+            ServerCommand::AddClient(options) => {
+                assert_eq!(options.name.as_deref(), Some("laptop"));
+                assert_eq!(options.server, "panel.example.com");
+                assert_eq!(options.port, Some(9443));
+                assert_eq!(options.config_path, PathBuf::from("configs/server.yaml"));
             }
-            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
-            unknown => bail!("unknown add-client option: {unknown}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
-    Ok(setup::AddClientOptions {
-        name: Some(name.ok_or_else(|| anyhow!("add-client requires --name <name>"))?),
-        server: server.ok_or_else(|| anyhow!("add-client requires --server <host-or-ip>"))?,
-        port,
-        config_path,
-    })
-}
+    #[test]
+    fn parse_cli_accepts_client_list_alias() {
+        let command = Cli::try_parse_from([
+            "shroud-server",
+            "list-clients",
+            "--server",
+            "panel.example.com",
+            "--port",
+            "8443",
+        ])
+        .expect("parse list-clients")
+        .into_command();
 
-fn parse_client_list_args(
-    mut args: impl Iterator<Item = String>,
-) -> Result<setup::ClientListOptions> {
-    let mut server = None;
-    let mut port = None;
-    let mut config_path = PathBuf::from("configs/server.yaml");
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--server" => server = Some(next_arg(&mut args, "--server")?),
-            "--port" => {
-                let raw = next_arg(&mut args, "--port")?;
-                port = Some(
-                    raw.parse::<u16>()
-                        .with_context(|| format!("invalid --port value: {raw}"))?,
-                );
+        match command {
+            ServerCommand::ClientList(options) => {
+                assert_eq!(options.server, "panel.example.com");
+                assert_eq!(options.port, Some(8443));
+                assert_eq!(options.config_path, PathBuf::from("configs/server.yaml"));
             }
-            "--config" => config_path = PathBuf::from(next_arg(&mut args, "--config")?),
-            unknown => bail!("unknown client-list option: {unknown}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
-
-    Ok(setup::ClientListOptions {
-        server: server.ok_or_else(|| anyhow!("client-list requires --server <host-or-ip>"))?,
-        port,
-        config_path,
-    })
-}
-
-fn next_arg(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| anyhow!("{option} requires a value"))
-}
-
-fn print_setup_usage() {
-    println!("Usage:");
-    println!("  shroud-server setup --server <host-or-ip> --port <port> [options]");
-    println!();
-    println!("Options:");
-    println!("  --name <name>      Client display name stored in server.yaml");
-    println!("  --config <path>    Server config path (default: configs/server.yaml)");
-    println!("  --cert-dir <path>  Certificate directory (default: certs)");
-    println!("  --force-certs      Regenerate server.crt and server.key");
-    println!("  --force-client     Generate a new authorized client");
-}
-
-fn print_generate_certs_usage() {
-    println!("Usage:");
-    println!("  shroud-server generate-certs --server <host-or-ip> [options]");
-    println!();
-    println!("Options:");
-    println!("  --config <path>    Server config path (default: configs/server.yaml)");
-    println!("  --cert-dir <path>  Certificate directory (default: certs)");
-    println!("  --force            Regenerate server.crt and server.key");
-}
-
-fn print_add_client_usage() {
-    println!("Usage:");
-    println!("  shroud-server add-client --name <name> --server <host-or-ip> [options]");
-    println!();
-    println!("Options:");
-    println!("  --port <port>      Public server port (default: server.yaml listen port)");
-    println!("  --config <path>    Server config path (default: configs/server.yaml)");
-}
-
-fn print_client_list_usage() {
-    println!("Usage:");
-    println!("  shroud-server client-list --server <host-or-ip> [options]");
-    println!();
-    println!("Options:");
-    println!("  --port <port>      Public server port (default: server.yaml listen port)");
-    println!("  --config <path>    Server config path (default: configs/server.yaml)");
 }

@@ -385,9 +385,6 @@ impl eframe::App for ShroudGuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Shroud Client");
-            ui.separator();
-
             ui.heading("Configs");
 
             if self.configs.is_empty() {

@@ -145,6 +145,8 @@ cat > "$SERVER_CFG" <<YAML
 listen: "0.0.0.0:${SERVER_PORT}"
 tunnel_path: "/api/tunnel"
 web_root: "${ROOT_DIR}/web"
+logging:
+  level: "info"
 tls:
   enabled: true
   cert_path: "${ROOT_DIR}/certs/localhost.crt"
@@ -163,6 +165,9 @@ inbounds:
     mtu: 1400
     auto_route: true
     dns: "127.0.0.1"
+
+logging:
+  level: "info"
 
 outbound:
   server: "${SERVER_IP}"
@@ -211,7 +216,7 @@ TARGET_PID=$!
 wait_for_url "$CLIENT_NS" "https://${SERVER_IP}:${SERVER_PORT}/"
 wait_for_url "$SERVER_NS" "http://${TARGET_IP}:${TARGET_PORT}/"
 
-RUST_LOG="${RUST_LOG:-info}" ip netns exec "$CLIENT_NS" "$CLIENT_BIN" "$CLIENT_CFG" \
+ip netns exec "$CLIENT_NS" "$CLIENT_BIN" "$CLIENT_CFG" \
     > "$TMP_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 

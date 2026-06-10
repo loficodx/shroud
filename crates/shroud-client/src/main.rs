@@ -1,10 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use shroud_client::{routing, session, socks5, transport, tun};
-use shroud_core::config::load_client_config_yaml;
+use shroud_core::config::{LoggingConfig, load_client_config_yaml};
 use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -26,28 +27,26 @@ use tracing_subscriber::EnvFilter;
 // sudo SHROUD_SMOKE_BUILD=0 ./scripts/tun-smoke-linux.sh
 #[tokio::main]
 async fn main() -> Result<()> {
-    let command = parse_cli()?;
+    let command = Cli::parse().into_command()?;
     match command {
         ClientCommand::Run {
             config_path,
             log_format,
-        } => {
-            init_tracing(log_format);
-            run_client(config_path).await
-        }
+        } => run_client(config_path, log_format).await,
         ClientCommand::Import(options) => {
-            init_tracing(LogFormat::Plain);
+            init_tracing(LogFormat::Plain, &LoggingConfig::default());
             run_import_command(options)?;
             Ok(())
         }
     }
 }
 
-async fn run_client(config_path: String) -> Result<()> {
+async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
     let raw = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read client config: {config_path}"))?;
+        .with_context(|| format!("failed to read client config: {}", config_path.display()))?;
     let cfg = load_client_config_yaml(&raw)
-        .with_context(|| format!("failed to load client config: {config_path}"))?;
+        .with_context(|| format!("failed to load client config: {}", config_path.display()))?;
+    init_tracing(log_format, &cfg.logging);
     for warning in cfg.transport_compat_warnings() {
         warn!(warning = %warning, "deprecated client transport config");
     }
@@ -127,31 +126,48 @@ async fn run_client(config_path: String) -> Result<()> {
     socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
-fn init_tracing(log_format: LogFormat) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+fn init_tracing(log_format: LogFormat, logging: &LoggingConfig) {
+    let filter = EnvFilter::new(logging.level.trim());
     match log_format {
-        LogFormat::Plain => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        LogFormat::Plain => tracing_subscriber::fmt().with_env_filter(filter).init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
-            .with_env_filter(env_filter)
+            .with_env_filter(filter)
             .init(),
     }
 }
 
-fn parse_cli() -> Result<ClientCommand> {
-    parse_cli_args(std::env::args().skip(1))
+#[derive(Debug, Parser)]
+#[command(name = "shroud-client")]
+struct Cli {
+    #[arg(value_name = "config-path")]
+    config_path: Option<PathBuf>,
+
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "path",
+        conflicts_with = "config_path"
+    )]
+    config: Option<PathBuf>,
+
+    #[arg(long = "log-format", value_enum, default_value = "plain")]
+    log_format: LogFormat,
+
+    #[command(subcommand)]
+    command: Option<ClientSubcommand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClientCommand {
     Run {
-        config_path: String,
+        config_path: PathBuf,
         log_format: LogFormat,
     },
     Import(ImportOptions),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum LogFormat {
     Plain,
     Json,
@@ -160,109 +176,44 @@ enum LogFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportOptions {
     raw: String,
-    output: Option<String>,
+    output: Option<PathBuf>,
     force: bool,
 }
 
-fn parse_cli_args<I, S>(args: I) -> Result<ClientCommand>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut args = args.into_iter();
-    let first = args.next();
-    let first = first.map(Into::into);
-    if matches!(
-        first.as_deref(),
-        Some("generate-credentials") | Some("gen-credentials")
-    ) {
-        bail!(
-            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
-        );
-    }
-
-    if matches!(first.as_deref(), Some("import")) {
-        return parse_import_args(args.map(Into::into));
-    }
-
-    parse_run_args(first.into_iter().chain(args.map(Into::into)))
+#[derive(Debug, Subcommand)]
+enum ClientSubcommand {
+    Import(ImportArgs),
 }
 
-fn parse_run_args(args: impl Iterator<Item = String>) -> Result<ClientCommand> {
-    let mut config_path = None;
-    let mut log_format = LogFormat::Plain;
-    let mut args = args.peekable();
+#[derive(Debug, clap::Args)]
+struct ImportArgs {
+    #[arg(value_name = "shrd:1:...")]
+    raw: String,
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--config" | "-c" => {
-                set_config_path(&mut config_path, next_arg(&mut args, "--config")?)?
-            }
-            "--log-format" => log_format = parse_log_format(&next_arg(&mut args, "--log-format")?)?,
-            "--help" | "-h" => bail!(
-                "Usage: shroud-client [--config <path>] [--log-format plain|json]\n       shroud-client <config-path>\n       shroud-client import <shrd:1:...> [--output <path>] [--force]"
-            ),
-            unknown if unknown.starts_with('-') => bail!("unknown client option: {unknown}"),
-            value => set_config_path(&mut config_path, value.to_string())?,
+    #[arg(short = 'o', long = "output", value_name = "path")]
+    output: Option<PathBuf>,
+
+    #[arg(long = "force")]
+    force: bool,
+}
+
+impl Cli {
+    fn into_command(self) -> Result<ClientCommand> {
+        match self.command {
+            Some(ClientSubcommand::Import(args)) => Ok(ClientCommand::Import(ImportOptions {
+                raw: args.raw,
+                output: args.output,
+                force: args.force,
+            })),
+            None => Ok(ClientCommand::Run {
+                config_path: self
+                    .config
+                    .or(self.config_path)
+                    .unwrap_or_else(|| PathBuf::from("configs/client.yaml")),
+                log_format: self.log_format,
+            }),
         }
     }
-
-    Ok(ClientCommand::Run {
-        config_path: config_path.unwrap_or_else(|| "configs/client.yaml".to_string()),
-        log_format,
-    })
-}
-
-fn set_config_path(config_path: &mut Option<String>, value: String) -> Result<()> {
-    if config_path.replace(value).is_some() {
-        bail!("client accepts only one config path");
-    }
-    Ok(())
-}
-
-fn parse_log_format(value: &str) -> Result<LogFormat> {
-    match value {
-        "plain" => Ok(LogFormat::Plain),
-        "json" => Ok(LogFormat::Json),
-        _ => bail!("unsupported log format: {value}. Expected plain or json"),
-    }
-}
-
-fn parse_import_args(mut args: impl Iterator<Item = String>) -> Result<ClientCommand> {
-    let mut raw = None;
-    let mut output = None;
-    let mut force = false;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--output" | "-o" => output = Some(next_arg(&mut args, "--output")?),
-            "--force" => force = true,
-            "--help" | "-h" => {
-                bail!("Usage: shroud-client import <shrd:1:...> [--output <path>] [--force]")
-            }
-            unknown if unknown.starts_with('-') => bail!("unknown import option: {unknown}"),
-            value => {
-                if raw.replace(value.to_string()).is_some() {
-                    bail!("import accepts exactly one import string");
-                }
-            }
-        }
-    }
-
-    Ok(ClientCommand::Import(ImportOptions {
-        raw: raw.ok_or_else(|| {
-            anyhow::anyhow!(
-                "import requires an import string.\nUsage: shroud-client import <shrd:1:...> [--output <path>] [--force]"
-            )
-        })?,
-        output,
-        force,
-    }))
-}
-
-fn next_arg(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| anyhow::anyhow!("{option} requires a value"))
 }
 
 fn run_import_command(options: ImportOptions) -> Result<()> {
@@ -272,28 +223,31 @@ fn run_import_command(options: ImportOptions) -> Result<()> {
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&conn.server);
-    let output_path = options
-        .output
-        .unwrap_or_else(|| default_import_output_path(Some(default_file_name_source)));
+    let output_path = options.output.unwrap_or_else(|| {
+        PathBuf::from(default_import_output_path(Some(default_file_name_source)))
+    });
     let yaml = render_client_yaml_from_import(conn)?;
-    create_parent_dir(Path::new(&output_path))?;
+    create_parent_dir(&output_path)?;
 
     if options.force {
         fs::write(&output_path, yaml)
-            .with_context(|| format!("failed to write client config: {output_path}"))?;
+            .with_context(|| format!("failed to write client config: {}", output_path.display()))?;
     } else {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&output_path)
             .with_context(|| {
-                format!("failed to create client config: {output_path}. Use --force to overwrite")
+                format!(
+                    "failed to create client config: {}. Use --force to overwrite",
+                    output_path.display()
+                )
             })?;
         file.write_all(yaml.as_bytes())
-            .with_context(|| format!("failed to write client config: {output_path}"))?;
+            .with_context(|| format!("failed to write client config: {}", output_path.display()))?;
     }
 
-    println!("Client config written: {output_path}");
+    println!("Client config written: {}", output_path.display());
     Ok(())
 }
 
@@ -343,9 +297,10 @@ fn sanitize_profile_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientCommand, ImportOptions, LogFormat, default_import_output_path, parse_cli_args,
+        Cli, ClientCommand, ImportOptions, LogFormat, default_import_output_path,
         run_import_command,
     };
+    use clap::Parser;
     use shroud_core::config::{TransportMode, load_client_config_yaml};
     use shroud_core::import::{ImportConnection, encode_import_connection};
     use std::fs;
@@ -354,12 +309,15 @@ mod tests {
 
     #[test]
     fn parse_cli_defaults_to_sample_client_config() {
-        let config_path = parse_cli_args(std::iter::empty::<&str>()).expect("parse default config");
+        let config_path = Cli::try_parse_from(["shroud-client"])
+            .expect("parse default config")
+            .into_command()
+            .expect("build command");
 
         assert_eq!(
             config_path,
             ClientCommand::Run {
-                config_path: "configs/client.yaml".to_string(),
+                config_path: PathBuf::from("configs/client.yaml"),
                 log_format: LogFormat::Plain,
             }
         );
@@ -367,12 +325,15 @@ mod tests {
 
     #[test]
     fn parse_cli_accepts_config_path() {
-        let config_path = parse_cli_args(["custom-client.yaml"]).expect("parse custom config");
+        let config_path = Cli::try_parse_from(["shroud-client", "custom-client.yaml"])
+            .expect("parse custom config")
+            .into_command()
+            .expect("build command");
 
         assert_eq!(
             config_path,
             ClientCommand::Run {
-                config_path: "custom-client.yaml".to_string(),
+                config_path: PathBuf::from("custom-client.yaml"),
                 log_format: LogFormat::Plain,
             }
         );
@@ -381,12 +342,15 @@ mod tests {
     #[test]
     fn parse_cli_accepts_explicit_config_path() {
         let command =
-            parse_cli_args(["--config", "configs/client-laptop.yaml"]).expect("parse --config");
+            Cli::try_parse_from(["shroud-client", "--config", "configs/client-laptop.yaml"])
+                .expect("parse --config")
+                .into_command()
+                .expect("build command");
 
         assert_eq!(
             command,
             ClientCommand::Run {
-                config_path: "configs/client-laptop.yaml".to_string(),
+                config_path: PathBuf::from("configs/client-laptop.yaml"),
                 log_format: LogFormat::Plain,
             }
         );
@@ -394,18 +358,21 @@ mod tests {
 
     #[test]
     fn parse_cli_accepts_log_format() {
-        let command = parse_cli_args([
+        let command = Cli::try_parse_from([
+            "shroud-client",
             "--config",
             "configs/client-laptop.yaml",
             "--log-format",
             "json",
         ])
-        .expect("parse --log-format");
+        .expect("parse --log-format")
+        .into_command()
+        .expect("build command");
 
         assert_eq!(
             command,
             ClientCommand::Run {
-                config_path: "configs/client-laptop.yaml".to_string(),
+                config_path: PathBuf::from("configs/client-laptop.yaml"),
                 log_format: LogFormat::Json,
             }
         );
@@ -413,20 +380,23 @@ mod tests {
 
     #[test]
     fn parse_cli_accepts_import_command() {
-        let command = parse_cli_args([
+        let command = Cli::try_parse_from([
+            "shroud-client",
             "import",
             "shrd:1:test",
             "--output",
             "configs/client-laptop.yaml",
             "--force",
         ])
-        .expect("parse import command");
+        .expect("parse import command")
+        .into_command()
+        .expect("build command");
 
         assert_eq!(
             command,
             ClientCommand::Import(ImportOptions {
                 raw: "shrd:1:test".to_string(),
-                output: Some("configs/client-laptop.yaml".to_string()),
+                output: Some(PathBuf::from("configs/client-laptop.yaml")),
                 force: true,
             })
         );
@@ -465,7 +435,7 @@ mod tests {
 
         run_import_command(ImportOptions {
             raw: raw.clone(),
-            output: Some(output_path.to_string_lossy().into_owned()),
+            output: Some(output_path.clone()),
             force: false,
         })
         .expect("import config");
@@ -477,33 +447,13 @@ mod tests {
 
         let err = run_import_command(ImportOptions {
             raw,
-            output: Some(output_path.to_string_lossy().into_owned()),
+            output: Some(output_path.clone()),
             force: false,
         })
         .expect_err("reject overwrite");
         assert!(err.to_string().contains("Use --force to overwrite"));
 
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn parse_cli_rejects_generate_credentials_command() {
-        let err = parse_cli_args(["generate-credentials"]).expect_err("command must fail");
-
-        assert_eq!(
-            err.to_string(),
-            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
-        );
-    }
-
-    #[test]
-    fn parse_cli_rejects_gen_credentials_alias() {
-        let err = parse_cli_args(["gen-credentials"]).expect_err("alias must fail");
-
-        assert_eq!(
-            err.to_string(),
-            "Credential generation moved to shroud-server provisioning.\nRun: shroud-server generate-certs --server <host>\nThen: shroud-server add-client --name <name> --server <host>"
-        );
     }
 
     fn unique_temp_dir() -> PathBuf {

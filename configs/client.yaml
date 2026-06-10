@@ -11,6 +11,9 @@ inbounds:
     auto_route: false
     dns: "10.10.0.53"
 
+logging:
+  level: "info"
+
 transport:
   mode: raw_tcp
   server: "127.0.0.1"

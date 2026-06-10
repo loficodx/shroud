@@ -168,6 +168,9 @@ inbounds:
     auto_route: false
     dns: "10.10.0.53"
 
+logging:
+  level: "info"
+
 transport:
   mode: raw_tcp
   server: "127.0.0.1"
@@ -219,6 +222,8 @@ Example server config:
 listen: "0.0.0.0:8443"
 tunnel_path: "/api/tunnel"
 web_root: "./web"
+logging:
+  level: "info"
 transport:
   modes:
     - raw_tcp
@@ -248,6 +253,8 @@ clients:
 ```
 
 `security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
+
+`logging.level` controls runtime log verbosity for both `shroud-client` and `shroud-server`. Supported values are `trace`, `debug`, `info`, `warn`, `error`, and `off`; `RUST_LOG` is not used for the client/server log level.
 
 ## Server Setup
 
@@ -314,19 +321,7 @@ cargo run -p shroud-client -- import 'shrd:1:...' --output configs/client-laptop
 
 If `--output` is omitted, the client writes `client-<name>.yaml` using the profile name from the import string. Existing files are not overwritten unless `--force` is passed.
 
-`setup` is still available as a compatibility shortcut. It runs the same provisioning path and prints a note recommending `generate-certs` and `add-client` for production use:
-
-```bash
-cargo run -p shroud-server -- setup --server 104.20.23.154 --port 8443 --name laptop
-```
-
 The old `scripts/generate-certs.sh` helper is still present for manual development workflows that need a local CA and an OpenSSL-generated server certificate. It is not required for the recommended provisioning workflow.
-
-Legacy/manual credential generation still exists on the server for development:
-
-```bash
-cargo run -p shroud-server -- generate-credentials
-```
 
 ## Run
 

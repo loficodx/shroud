@@ -1,7 +1,7 @@
 use crate::config::{
     ClientAuthConfig, ClientConfig, ClientDnsConfig, ClientInboundsConfig, LimitsConfig,
-    RelayConfig, RoutingConfig, SocksInboundConfig, TimeoutsConfig, TransportConfig, TransportMode,
-    TunInboundConfig,
+    LoggingConfig, RelayConfig, RoutingConfig, SocksInboundConfig, TimeoutsConfig, TransportConfig,
+    TransportMode, TunInboundConfig,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -71,6 +71,7 @@ struct ImportClientYaml {
     limits: LimitsConfig,
     routing: RoutingConfig,
     dns: ClientDnsConfig,
+    logging: LoggingConfig,
 }
 
 impl From<ImportConnection> for ImportClientYaml {
@@ -102,6 +103,7 @@ impl From<ImportConnection> for ImportClientYaml {
             limits: LimitsConfig::default(),
             routing: RoutingConfig::default(),
             dns: ClientDnsConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }

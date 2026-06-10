@@ -6,8 +6,6 @@ services:
     image: shroud-server:local
     container_name: shroud-server
     command: ["configs/server.yaml"]
-    environment:
-      RUST_LOG: ${RUST_LOG:-debug}
     ports:
       - "8443:8443"
     dns:
