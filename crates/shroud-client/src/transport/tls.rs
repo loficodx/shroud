@@ -16,12 +16,41 @@ use tokio_rustls::rustls::{
     RootCertStore, SignatureScheme,
 };
 
-pub(crate) fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
-    if let Some(pin) = &outbound.tls_server_cert_sha256 {
-        return build_pinned_tls_client_config(pin);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsAlpn {
+    None,
+    #[allow(dead_code)]
+    Http2,
+}
 
-    build_root_store_tls_client_config(outbound)
+pub(crate) fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+    build_tls_client_config_with_alpn(outbound, TlsAlpn::None)
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_http2_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+    build_tls_client_config_with_alpn(outbound, TlsAlpn::Http2)
+}
+
+pub(crate) fn build_tls_client_config_with_alpn(
+    outbound: &OutboundConfig,
+    alpn: TlsAlpn,
+) -> Result<ClientConfig> {
+    let config = if let Some(pin) = &outbound.tls_server_cert_sha256 {
+        build_pinned_tls_client_config(pin)?
+    } else {
+        build_root_store_tls_client_config(outbound)?
+    };
+
+    Ok(apply_alpn(config, alpn))
+}
+
+fn apply_alpn(mut config: ClientConfig, alpn: TlsAlpn) -> ClientConfig {
+    config.alpn_protocols = match alpn {
+        TlsAlpn::None => Vec::new(),
+        TlsAlpn::Http2 => vec![b"h2".to_vec()],
+    };
+    config
 }
 
 fn build_root_store_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
@@ -142,3 +171,31 @@ impl fmt::Display for PinMismatch {
 }
 
 impl StdError for PinMismatch {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outbound_config() -> OutboundConfig {
+        OutboundConfig {
+            server: "localhost".to_string(),
+            port: 443,
+            tls: true,
+            ..OutboundConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_tls_config_does_not_advertise_alpn() {
+        let config = build_tls_client_config(&outbound_config()).unwrap();
+
+        assert!(config.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn http2_tls_config_advertises_h2_alpn() {
+        let config = build_http2_tls_client_config(&outbound_config()).unwrap();
+
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+}

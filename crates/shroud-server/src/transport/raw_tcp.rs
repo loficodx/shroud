@@ -1,17 +1,16 @@
 use crate::auth::validate_auth_bytes;
-use anyhow::{Context, Result, anyhow};
+use crate::transport::tcp_target::{TargetConnectError, connect_target};
+use anyhow::{Context, Result};
 use shroud_core::config::{AuthorizedClient, RelayConfig, ServerSecurityConfig, TimeoutsConfig};
 use shroud_core::tcp_handshake::{
     ClientAuthProof, TcpConnectStatus, read_raw_tcp_connect_request, write_raw_tcp_connect_status,
 };
 use std::collections::HashMap;
-use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::debug;
@@ -105,14 +104,15 @@ where
         return Ok(());
     }
 
-    let target_connect_started = Instant::now();
-    let mut target = match timeout(
+    let connected_target = match connect_target(
+        &req.host,
+        req.port,
+        &state.security,
         state.target_connect_timeout,
-        connect_target(&req.host, req.port, &state.security),
     )
     .await
     {
-        Err(_) => {
+        Err(TargetConnectError::Timeout { connect_ms }) => {
             write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::ConnectFailed)
                 .await
                 .context("failed to write raw_tcp target timeout status")?;
@@ -121,13 +121,13 @@ where
                 target_host = %req.host,
                 target_port = req.port,
                 auth_result = "ok",
-                target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                target_tcp_connect_ms = connect_ms,
                 close_reason = "target_connect_timeout",
                 "raw_tcp target connect timed out"
             );
             return Ok(());
         }
-        Ok(Err(TargetConnectError::Forbidden(reason))) => {
+        Err(TargetConnectError::Forbidden { reason, connect_ms }) => {
             write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::Forbidden)
                 .await
                 .context("failed to write raw_tcp target ACL status")?;
@@ -136,14 +136,15 @@ where
                 target_host = %req.host,
                 target_port = req.port,
                 auth_result = "ok",
-                target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                target_tcp_connect_ms = connect_ms,
                 close_reason = "target_forbidden",
                 reason,
                 "raw_tcp target blocked by ACL"
             );
             return Ok(());
         }
-        Ok(Err(err)) => {
+        Err(err) => {
+            let connect_ms = err.connect_ms();
             write_raw_tcp_connect_status(&mut inbound, TcpConnectStatus::ConnectFailed)
                 .await
                 .context("failed to write raw_tcp target failure status")?;
@@ -152,16 +153,17 @@ where
                 target_host = %req.host,
                 target_port = req.port,
                 auth_result = "ok",
-                target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed()),
+                target_tcp_connect_ms = connect_ms,
                 close_reason = "target_connect_failed",
                 error = %err,
                 "raw_tcp target connect failed"
             );
             return Ok(());
         }
-        Ok(Ok(stream)) => stream,
+        Ok(connected_target) => connected_target,
     };
 
+    let mut target = connected_target.stream;
     target.set_nodelay(true).with_context(|| {
         format!(
             "failed to enable TCP_NODELAY for raw_tcp target {}:{}",
@@ -173,7 +175,7 @@ where
         .await
         .context("failed to write raw_tcp OK status")?;
 
-    let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+    let target_tcp_connect_ms = connected_target.connect_ms;
     let relay_started = Instant::now();
     let (bytes_up, bytes_down) = tokio::io::copy_bidirectional_with_sizes(
         &mut inbound,
@@ -199,84 +201,6 @@ where
 
     Ok(())
 }
-
-async fn connect_target(
-    host: &str,
-    port: u16,
-    security: &ServerSecurityConfig,
-) -> Result<TcpStream, TargetConnectError> {
-    if !security.allow_ports.is_empty() && !security.allow_ports.contains(&port) {
-        return Err(TargetConnectError::Forbidden(
-            "target port is not in security.allow_ports".to_string(),
-        ));
-    }
-
-    let addresses: Vec<SocketAddr> = lookup_host((host, port))
-        .await
-        .map_err(|err| TargetConnectError::Connect(anyhow!(err).context("target DNS failed")))?
-        .collect();
-
-    if addresses.is_empty() {
-        return Err(TargetConnectError::Connect(anyhow!(
-            "target DNS returned no addresses"
-        )));
-    }
-
-    let mut allowed_addresses = Vec::with_capacity(addresses.len());
-    for address in addresses {
-        if target_ip_denied(address.ip(), security) {
-            continue;
-        }
-        allowed_addresses.push(address);
-    }
-
-    if allowed_addresses.is_empty() {
-        return Err(TargetConnectError::Forbidden(
-            "all resolved target addresses are denied".to_string(),
-        ));
-    }
-
-    let mut last_error = None;
-    for address in allowed_addresses {
-        match TcpStream::connect(address).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last_error = Some(err),
-        }
-    }
-
-    Err(TargetConnectError::Connect(match last_error {
-        Some(err) => anyhow!(err).context("failed to connect to allowed target addresses"),
-        None => anyhow!("target DNS returned no allowed addresses"),
-    }))
-}
-
-fn target_ip_denied(ip: IpAddr, security: &ServerSecurityConfig) -> bool {
-    if !security.deny_private_ips {
-        return false;
-    }
-
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-    }
-}
-
-#[derive(Debug)]
-enum TargetConnectError {
-    Forbidden(String),
-    Connect(anyhow::Error),
-}
-
-impl fmt::Display for TargetConnectError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Forbidden(reason) => write!(f, "{reason}"),
-            Self::Connect(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for TargetConnectError {}
 
 async fn verify_raw_tcp_auth(state: &RawTcpServerState, auth: &ClientAuthProof) -> Result<bool> {
     let now = SystemTime::now()

@@ -918,11 +918,7 @@ fn validate_server_transport_config(
     }
     for mode in &transport.modes {
         match mode {
-            TransportMode::RawTcp => {}
-            TransportMode::Http2 => errors.push(ConfigFieldError::new(
-                format!("{base_path}.modes"),
-                "http2 transport is reserved but not implemented yet",
-            )),
+            TransportMode::RawTcp | TransportMode::Http2 => {}
             TransportMode::Http3 => errors.push(ConfigFieldError::new(
                 format!("{base_path}.modes"),
                 "http3 transport is reserved but not implemented yet",
@@ -1545,6 +1541,7 @@ web_root: "."
 transport:
   modes:
     - raw_tcp
+    - http2
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "secret"
@@ -1552,7 +1549,10 @@ clients:
 
         let cfg = load_server_config_yaml(raw).expect("valid config");
 
-        assert_eq!(cfg.transport.modes, vec![TransportMode::RawTcp]);
+        assert_eq!(
+            cfg.transport.modes,
+            vec![TransportMode::RawTcp, TransportMode::Http2]
+        );
         assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
         assert_eq!(cfg.relay.upload_buffer_size, 65_536);
         assert_eq!(cfg.relay.download_buffer_size, 65_536);
@@ -1725,7 +1725,6 @@ web_root: "."
 transport:
   modes:
     - raw_tcp
-    - http2
     - http3
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
@@ -1734,7 +1733,6 @@ clients:
 
         let err = load_server_config_yaml(raw).expect_err("invalid config");
 
-        assert!(err.to_string().contains("http2 transport is reserved"));
         assert!(err.to_string().contains("http3 transport is reserved"));
     }
 

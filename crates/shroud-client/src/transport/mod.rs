@@ -1,3 +1,4 @@
+pub mod http2;
 pub mod raw_tcp;
 pub(crate) mod tls;
 
@@ -42,7 +43,9 @@ pub fn build_tcp_transport(
         TransportMode::RawTcp => Ok(Arc::new(raw_tcp::RawTcpTransport::with_timeouts(
             outbound, auth, timeouts,
         )?)),
-        TransportMode::Http2 => bail!("http2 transport is reserved but not implemented yet"),
+        TransportMode::Http2 => Ok(Arc::new(http2::Http2Transport::with_timeouts(
+            outbound, auth, timeouts,
+        )?)),
         TransportMode::Http3 => bail!("http3 transport is reserved but not implemented yet"),
     }
 }

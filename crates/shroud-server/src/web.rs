@@ -1,7 +1,8 @@
 use crate::auth::validate_auth;
 use crate::relay::relay_tunnel;
+use crate::transport::http2::handle_http2_connection;
 use crate::transport::raw_tcp::{RawTcpServerState, handle_raw_tcp_connection};
-use crate::transport::tls::build_tls_acceptor;
+use crate::transport::tls::{TlsAlpn, build_tls_acceptor_with_alpn};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -32,7 +33,12 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
-    let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
+    let tls_alpn = if cfg.transport.modes.contains(&TransportMode::Http2) {
+        TlsAlpn::Http2
+    } else {
+        TlsAlpn::None
+    };
+    let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.tls, tls_alpn)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
     let raw_tcp_state = RawTcpServerState::with_relay_config(
         cfg.clients.clone(),
@@ -148,6 +154,7 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let http2_enabled = cfg.transport.modes.contains(&TransportMode::Http2);
     if cfg.transport.modes.contains(&TransportMode::RawTcp) {
         let (stream, is_raw_tcp) = sniff_raw_tcp_magic(
             stream,
@@ -157,9 +164,16 @@ where
         if is_raw_tcp {
             return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
         }
+        if http2_enabled {
+            return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
+        }
 
         debug!(%peer, "rejecting unsupported server protocol");
         bail!("unsupported server protocol");
+    }
+
+    if http2_enabled {
+        return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
     }
 
     handle_http_connection(stream, peer, cfg, nonce_cache).await
