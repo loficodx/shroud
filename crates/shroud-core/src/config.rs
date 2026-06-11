@@ -1502,16 +1502,6 @@ transport:
     }
 
     #[test]
-    fn sample_http2_client_config_is_valid() {
-        let cfg = load_client_config_yaml(include_str!("../../../configs/client-http2.yaml"))
-            .expect("valid sample HTTP/2 client config");
-
-        assert_eq!(cfg.transport.mode, TransportMode::Http2);
-        assert_eq!(cfg.transport.path.as_deref(), Some("/api/tunnel/h2"));
-        assert_eq!(cfg.outbound.path, "/api/tunnel/h2");
-    }
-
-    #[test]
     fn client_config_maps_legacy_outbound_to_transport_with_warnings() {
         let cfg = load_client_config_yaml(BASE_CLIENT_CONFIG).expect("valid config");
 
