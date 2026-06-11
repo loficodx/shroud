@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -274,9 +275,9 @@ async fn validate_http2_request(
 async fn relay_http2_stream(
     request_body: RecvStream,
     response_body: SendStream<Bytes>,
-    target: tokio::net::TcpStream,
+    target: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
 ) -> Result<(u64, u64)> {
-    let (mut target_read, mut target_write) = target.into_split();
+    let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let upload = tokio::spawn(async move {
         let mut request_body = request_body;
@@ -320,17 +321,49 @@ async fn relay_http2_stream(
     tokio::pin!(upload);
     tokio::pin!(download);
 
-    tokio::select! {
+    let (upload_bytes, download_bytes) = tokio::select! {
         upload_result = &mut upload => {
-            let upload_bytes = flatten_join_result(upload_result, "HTTP/2 upload task")?;
-            let download_bytes = flatten_join_result(download.await, "HTTP/2 download task")?;
-            Ok((upload_bytes, download_bytes))
+            match flatten_join_result(upload_result, "HTTP/2 upload task") {
+                Ok(upload_bytes) => {
+                    let download_bytes = flatten_join_result(download.await, "HTTP/2 download task")?;
+                    (upload_bytes, download_bytes)
+                }
+                Err(err) => {
+                    download.abort();
+                    let _ = download.await;
+                    return Err(err);
+                }
+            }
         }
         download_result = &mut download => {
-            upload.abort();
-            let download_bytes = flatten_join_result(download_result, "HTTP/2 download task")?;
-            Ok((0, download_bytes))
+            match flatten_join_result(download_result, "HTTP/2 download task") {
+                Ok(download_bytes) => {
+                    let upload_bytes = finish_or_abort_upload(upload).await?;
+                    (upload_bytes, download_bytes)
+                }
+                Err(err) => {
+                    upload.abort();
+                    let _ = upload.await;
+                    return Err(err);
+                }
+            }
         }
+    };
+
+    Ok((upload_bytes, download_bytes))
+}
+
+async fn finish_or_abort_upload(
+    upload: Pin<&mut tokio::task::JoinHandle<Result<u64>>>,
+) -> Result<u64> {
+    if upload.is_finished() {
+        return flatten_join_result(upload.await, "HTTP/2 upload task");
+    }
+
+    upload.abort();
+    match upload.await {
+        Err(err) if err.is_cancelled() => Ok(0),
+        result => flatten_join_result(result, "HTTP/2 upload task"),
     }
 }
 
@@ -506,12 +539,10 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::auth::compute_auth_tag_bytes;
     use shroud_core::config::{
         AuthorizedClient, RelayConfig, ServerSecurityConfig, ServerTlsConfig,
         ServerTransportConfig, TimeoutsConfig, TransportMode,
     };
-    use tokio::net::TcpListener;
 
     const CLIENT_ID: &str = "11111111-1111-1111-1111-111111111111";
     const CLIENT_SECRET: &str = "test-secret";
@@ -540,22 +571,6 @@ mod tests {
                 created_at: None,
             }],
         })
-    }
-
-    fn auth_headers() -> (i64, String, String) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let nonce = vec![7u8; NONCE_LEN];
-        let auth_tag =
-            compute_auth_tag_bytes(CLIENT_SECRET.as_bytes(), &nonce, timestamp, CLIENT_ID).unwrap();
-
-        (
-            timestamp,
-            STANDARD_NO_PAD.encode(nonce),
-            STANDARD_NO_PAD.encode(auth_tag),
-        )
     }
 
     #[test]
@@ -594,36 +609,43 @@ mod tests {
 
     #[tokio::test]
     async fn relays_http2_stream_to_target() {
-        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_port = target_listener.local_addr().unwrap().port();
+        let (target_for_relay, mut target_peer) = tokio::io::duplex(64 * 1024);
         let target = tokio::spawn(async move {
-            let (mut socket, _) = target_listener.accept().await.unwrap();
             let mut buf = [0u8; 4];
-            socket.read_exact(&mut buf).await.unwrap();
+            target_peer.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
-            socket.write_all(b"pong").await.unwrap();
+            target_peer.write_all(b"pong").await.unwrap();
         });
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(handle_http2_connection(
-            server_io,
-            "127.0.0.1:12345".parse().unwrap(),
-            cfg(),
-        ));
+        let server = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let handler = tokio::spawn(async move {
+                let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let send = respond.send_response(response, false).unwrap();
+                relay_http2_stream(request.into_body(), send, target_for_relay)
+                    .await
+                    .unwrap()
+            });
+
+            let driver = tokio::spawn(async move {
+                while let Some(result) = server.accept().await {
+                    result.unwrap();
+                }
+            });
+
+            let result = handler.await.unwrap();
+            driver.abort();
+            result
+        });
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
         let connection = tokio::spawn(async move { connection.await.unwrap() });
-        let (timestamp, nonce, auth_tag) = auth_headers();
 
         client = client.ready().await.unwrap();
         let request = Request::builder()
             .method(Method::POST)
             .uri("https://localhost/api/tunnel/h2")
-            .header(HEADER_CLIENT_ID, CLIENT_ID)
-            .header(HEADER_TIMESTAMP, timestamp.to_string())
-            .header(HEADER_NONCE, nonce)
-            .header(HEADER_AUTH, auth_tag)
-            .header(HEADER_TARGET_HOST, "127.0.0.1")
-            .header(HEADER_TARGET_PORT, target_port.to_string())
             .body(())
             .unwrap();
         let (response, mut send) = client.send_request(request, false).unwrap();
@@ -643,7 +665,7 @@ mod tests {
         drop(send);
         drop(client);
         connection.await.unwrap();
-        server.await.unwrap().unwrap();
+        assert_eq!(server.await.unwrap(), (4, 4));
         target.await.unwrap();
     }
 }
