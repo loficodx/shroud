@@ -2,7 +2,7 @@ listen: "0.0.0.0:8443"
 tunnel_path: "/api/tunnel"
 web_root: "./web"
 logging:
-  level: "debug"
+  level: "info"
 transport:
   modes:
     - raw_tcp
