@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
 
@@ -93,6 +93,13 @@ impl Http2Transport {
         let tls = Http2Tls::new(&outbound)?;
         let timeouts = Http2ClientTimeouts::from(timeouts);
 
+        info!(
+            server = %outbound.server,
+            port = outbound.port,
+            tls = outbound.tls,
+            "selected HTTP/2 transport mode"
+        );
+
         Ok(Self {
             outbound,
             auth,
@@ -103,7 +110,10 @@ impl Http2Transport {
     }
 
     async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpTransportConnect> {
-        debug!(target_host, target_port, "opening HTTP/2 stream to target");
+        info!(
+            target = %format_target(target_host, target_port),
+            "opening HTTP/2 stream"
+        );
 
         let mut last_retryable = None;
         for attempt in 0..2 {
@@ -113,23 +123,29 @@ impl Http2Transport {
                 .await
             {
                 Ok(opened) => {
-                    debug!(
-                        target_host,
-                        target_port, "HTTP/2 stream established to target"
+                    info!(
+                        target = %format_target(target_host, target_port),
+                        "HTTP/2 stream established"
                     );
                     return Ok(TcpTransportConnect {
                         stream: Box::new(opened.stream),
                         metrics,
                     });
                 }
-                Err(OpenStreamError::Fatal(err)) => return Err(err),
+                Err(OpenStreamError::Fatal(err)) => {
+                    warn!(
+                        target = %format_target(target_host, target_port),
+                        error = %err,
+                        "HTTP/2 stream failed"
+                    );
+                    return Err(err);
+                }
                 Err(OpenStreamError::Retryable(err)) => {
                     warn!(
-                        target_host,
-                        target_port,
+                        target = %format_target(target_host, target_port),
                         attempt,
                         error = %err,
-                        "HTTP/2 stream failed; resetting shared connection"
+                        "HTTP/2 stream failed"
                     );
                     self.clear_connection().await;
                     last_retryable = Some(err);
@@ -137,7 +153,13 @@ impl Http2Transport {
             }
         }
 
-        Err(last_retryable.unwrap_or_else(|| anyhow!("HTTP/2 stream open failed")))
+        let err = last_retryable.unwrap_or_else(|| anyhow!("HTTP/2 stream open failed"));
+        warn!(
+            target = %format_target(target_host, target_port),
+            error = %err,
+            "HTTP/2 stream failed"
+        );
+        Err(err)
     }
 
     async fn get_or_open_connection(&self) -> Result<(SendRequest<Bytes>, TcpTransportMetrics)> {
@@ -160,7 +182,7 @@ impl Http2Transport {
     }
 
     async fn open_connection(&self) -> Result<Http2Connection> {
-        debug!(
+        info!(
             server = %self.outbound.server,
             port = self.outbound.port,
             "opening HTTP/2 connection to server"
@@ -226,9 +248,11 @@ impl Http2Transport {
             }
         });
 
-        debug!(
+        info!(
             server = %self.outbound.server,
             port = self.outbound.port,
+            server_tcp_connect_ms,
+            tls_handshake_ms,
             "HTTP/2 connection established"
         );
 
@@ -510,6 +534,10 @@ fn http_authority(outbound: &OutboundConfig) -> String {
 
 fn elapsed_millis(elapsed: Duration) -> u64 {
     elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn format_target(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
 }
 
 #[cfg(test)]

@@ -1502,6 +1502,16 @@ transport:
     }
 
     #[test]
+    fn sample_http2_client_config_is_valid() {
+        let cfg = load_client_config_yaml(include_str!("../../../configs/client-http2.yaml"))
+            .expect("valid sample HTTP/2 client config");
+
+        assert_eq!(cfg.transport.mode, TransportMode::Http2);
+        assert_eq!(cfg.transport.path.as_deref(), Some("/api/tunnel/h2"));
+        assert_eq!(cfg.outbound.path, "/api/tunnel/h2");
+    }
+
+    #[test]
     fn client_config_maps_legacy_outbound_to_transport_with_warnings() {
         let cfg = load_client_config_yaml(BASE_CLIENT_CONFIG).expect("valid config");
 
@@ -1560,6 +1570,15 @@ clients:
         assert!(cfg.security.deny_private_ips);
         assert!(cfg.security.allow_ports.is_empty());
         assert_eq!(cfg.logging.level, "info");
+    }
+
+    #[test]
+    fn sample_server_config_enables_http2_mode() {
+        let cfg: ServerConfig = serde_yaml::from_str(include_str!("../../../configs/server.yaml"))
+            .expect("parse sample server config");
+
+        assert!(cfg.transport.modes.contains(&TransportMode::RawTcp));
+        assert!(cfg.transport.modes.contains(&TransportMode::Http2));
     }
 
     #[test]

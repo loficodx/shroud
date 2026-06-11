@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
 const NONCE_LEN: usize = 16;
@@ -37,9 +37,19 @@ pub async fn handle_http2_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut connection = h2::server::handshake(stream)
-        .await
-        .context("failed to establish HTTP/2 server connection")?;
+    let mut connection = match h2::server::handshake(stream).await {
+        Ok(connection) => connection,
+        Err(err) => {
+            warn!(
+                %peer,
+                error = %err,
+                "HTTP/2 server handshake failed"
+            );
+            return Err(err).context("failed to establish HTTP/2 server connection");
+        }
+    };
+    info!(%peer, "accepted HTTP/2 connection");
+
     let state = Arc::new(Http2ServerState::new(cfg));
     let mut active = JoinSet::new();
 
@@ -101,9 +111,21 @@ async fn handle_http2_request(
         Ok(metadata) => metadata,
         Err(rejection) => {
             send_error_response(&mut respond, rejection.status).await?;
+            warn!(
+                %peer,
+                status = rejection.status.as_u16(),
+                reason = %rejection.reason,
+                "HTTP/2 stream rejected"
+            );
             bail!(rejection.reason);
         }
     };
+    let target = format_target(&metadata.target_host, metadata.target_port);
+    info!(
+        %peer,
+        target = %target,
+        "accepted HTTP/2 stream"
+    );
 
     let connected_target = match connect_target(
         &metadata.target_host,
@@ -115,11 +137,10 @@ async fn handle_http2_request(
     {
         Err(TargetConnectError::Timeout { connect_ms }) => {
             send_error_response(&mut respond, StatusCode::BAD_GATEWAY).await?;
-            debug!(
+            warn!(
                 %peer,
                 client_id = %metadata.client_id,
-                target_host = %metadata.target_host,
-                target_port = metadata.target_port,
+                target = %target,
                 target_tcp_connect_ms = connect_ms,
                 close_reason = "target_connect_timeout",
                 "HTTP/2 target connect timed out"
@@ -128,11 +149,10 @@ async fn handle_http2_request(
         }
         Err(TargetConnectError::Forbidden { reason, connect_ms }) => {
             send_error_response(&mut respond, StatusCode::FORBIDDEN).await?;
-            debug!(
+            warn!(
                 %peer,
                 client_id = %metadata.client_id,
-                target_host = %metadata.target_host,
-                target_port = metadata.target_port,
+                target = %target,
                 target_tcp_connect_ms = connect_ms,
                 close_reason = "target_forbidden",
                 reason,
@@ -143,11 +163,10 @@ async fn handle_http2_request(
         Err(err) => {
             let connect_ms = err.connect_ms();
             send_error_response(&mut respond, StatusCode::BAD_GATEWAY).await?;
-            debug!(
+            warn!(
                 %peer,
                 client_id = %metadata.client_id,
-                target_host = %metadata.target_host,
-                target_port = metadata.target_port,
+                target = %target,
                 target_tcp_connect_ms = connect_ms,
                 close_reason = "target_connect_failed",
                 error = %err,
@@ -157,6 +176,13 @@ async fn handle_http2_request(
         }
         Ok(connected_target) => connected_target,
     };
+    let target_tcp_connect_ms = connected_target.connect_ms;
+    info!(
+        %peer,
+        target = %target,
+        connect_ms = target_tcp_connect_ms,
+        "target connected"
+    );
 
     let target = connected_target.stream;
     target.set_nodelay(true).with_context(|| {
@@ -174,21 +200,19 @@ async fn handle_http2_request(
         .send_response(response, false)
         .context("failed to send HTTP/2 OK response")?;
 
-    let target_tcp_connect_ms = connected_target.connect_ms;
     let (upload_bytes, download_bytes) =
         relay_http2_stream(request.into_body(), send, target).await?;
 
-    debug!(
+    info!(
         %peer,
         client_id = %metadata.client_id,
-        target_host = %metadata.target_host,
-        target_port = metadata.target_port,
+        target = %format_target(&metadata.target_host, metadata.target_port),
         target_tcp_connect_ms,
-        relay_duration_ms = elapsed_millis(started.elapsed()),
-        relay_bytes_up = upload_bytes,
-        relay_bytes_down = download_bytes,
+        duration_ms = elapsed_millis(started.elapsed()),
+        bytes_up = upload_bytes,
+        bytes_down = download_bytes,
         close_reason = "closed",
-        "HTTP/2 server relay closed"
+        "HTTP/2 stream closed"
     );
 
     Ok(())
@@ -534,6 +558,10 @@ impl Http2NonceCache {
 
 fn elapsed_millis(elapsed: Duration) -> u64 {
     elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn format_target(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
 }
 
 #[cfg(test)]

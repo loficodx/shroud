@@ -6,6 +6,7 @@ logging:
 transport:
   modes:
     - raw_tcp
+    - http2
 tls:
   enabled: true
   cert_path: "certs/server.crt"

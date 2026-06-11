@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
@@ -89,7 +89,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                         .await
                         {
                             Err(_) => {
-                                debug!(
+                                warn!(
                                     %peer,
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
                                     "server TLS handshake timed out"
@@ -105,7 +105,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                 handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
                             }
                             Ok(Err(err)) => {
-                                debug!(
+                                warn!(
                                     %peer,
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
                                     error = %err,
@@ -747,7 +747,10 @@ fn optional_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::config::{AuthorizedClient, ServerSecurityConfig, ServerTlsConfig};
+    use shroud_core::config::{
+        AuthorizedClient, ServerSecurityConfig, ServerTlsConfig, ServerTransportConfig,
+        TransportMode,
+    };
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -854,6 +857,71 @@ mod tests {
 
         assert!(response.is_empty());
         assert!(err.to_string().contains("unsupported server protocol"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_dispatches_non_raw_tcp_prefix_to_http2_when_enabled() {
+        let web_root = TempWebRoot::new();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let cfg = ServerConfig {
+            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            tunnel_path: "/api/tunnel".to_string(),
+            web_root: web_root.path.to_string_lossy().into_owned(),
+            logging: Default::default(),
+            transport: ServerTransportConfig {
+                modes: vec![TransportMode::RawTcp, TransportMode::Http2],
+            },
+            tls: ServerTlsConfig::default(),
+            timeouts: Default::default(),
+            relay: Default::default(),
+            limits: Default::default(),
+            security: ServerSecurityConfig::default(),
+            clients: vec![AuthorizedClient {
+                name: None,
+                client_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                client_secret: "test-secret".to_string(),
+                created_at: None,
+            }],
+        };
+        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
+        let raw_tcp_state = RawTcpServerState::with_relay_config(
+            cfg.clients.clone(),
+            cfg.timeouts,
+            cfg.security.clone(),
+            cfg.relay,
+        );
+
+        let handle = tokio::spawn(async move {
+            handle_connection(
+                server,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+                cfg,
+                nonce_cache,
+                raw_tcp_state,
+            )
+            .await
+        });
+
+        let (mut h2_client, connection) = h2::client::handshake(client).await.unwrap();
+        let connection = tokio::spawn(async move { connection.await.unwrap() });
+
+        h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://localhost/api/tunnel/h2")
+            .body(())
+            .unwrap();
+        let (response, mut send) = h2_client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        send.send_data(bytes::Bytes::new(), true).ok();
+        drop(response);
+        drop(send);
+        drop(h2_client);
+
+        connection.await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]

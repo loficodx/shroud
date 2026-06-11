@@ -7,7 +7,7 @@ use shroud_client::transport::raw_tcp::RawTcpTransport;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
     RoutingConfig, RoutingRule, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
-    TimeoutsConfig, TransportMode,
+    ServerTransportConfig, TimeoutsConfig, TransportMode,
 };
 use shroud_server::web;
 use std::net::SocketAddr;
@@ -112,6 +112,39 @@ async fn curl_socks5_hostname_smoke_relays_to_target() -> TestResult {
         body.contains("shroud curl socks5h smoke ok"),
         "unexpected curl response through SOCKS tunnel: {body:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http2_socks_tls_tunnel_relays_multiple_requests_to_target() -> TestResult {
+    let target = start_http_target("shroud http2 smoke ok").await?;
+    let server =
+        start_tunnel_server_with_modes(vec![TransportMode::RawTcp, TransportMode::Http2]).await?;
+    let client = start_socks_client_with_mode(
+        server.addr,
+        RoutingConfig {
+            default: RouteAction::Proxy,
+            rules: vec![],
+        },
+        "/api/tunnel/h2",
+        CLIENT_SECRET,
+        TransportMode::Http2,
+    )
+    .await?;
+
+    for _ in 0..2 {
+        let mut stream = socks_connect(client.addr, "127.0.0.1", target.addr.port()).await?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: target\r\nConnection: close\r\n\r\n")
+            .await?;
+
+        let response = read_to_end(&mut stream).await?;
+        assert!(
+            response.contains("shroud http2 smoke ok"),
+            "unexpected HTTP response through HTTP/2 tunnel: {response:?}"
+        );
+    }
 
     Ok(())
 }
@@ -384,6 +417,7 @@ async fn dns_policy_can_block_ip_targets() -> TestResult {
             warn_on_ip_targets: true,
             block_ip_targets: true,
         },
+        TransportMode::RawTcp,
     )
     .await?;
 
@@ -396,13 +430,24 @@ async fn dns_policy_can_block_ip_targets() -> TestResult {
 }
 
 async fn start_tunnel_server() -> TestResult<RunningTask> {
+    start_tunnel_server_with_modes_and_path(vec![TransportMode::RawTcp], "/api/tunnel").await
+}
+
+async fn start_tunnel_server_with_modes(modes: Vec<TransportMode>) -> TestResult<RunningTask> {
+    start_tunnel_server_with_modes_and_path(modes, "/api/tunnel/h2").await
+}
+
+async fn start_tunnel_server_with_modes_and_path(
+    modes: Vec<TransportMode>,
+    tunnel_path: &str,
+) -> TestResult<RunningTask> {
     let addr = free_addr().await?;
     let cfg = ServerConfig {
         listen: addr,
-        tunnel_path: "/api/tunnel".to_string(),
+        tunnel_path: tunnel_path.to_string(),
         web_root: "./web".to_string(),
         logging: Default::default(),
-        transport: Default::default(),
+        transport: ServerTransportConfig { modes },
         tls: ServerTlsConfig {
             enabled: true,
             cert_path: Some(SERVER_CERT.to_string()),
@@ -436,12 +481,30 @@ async fn start_socks_client(
     tunnel_path: &str,
     client_secret: &str,
 ) -> TestResult<RunningTask> {
+    start_socks_client_with_mode(
+        tunnel_addr,
+        routing,
+        tunnel_path,
+        client_secret,
+        TransportMode::RawTcp,
+    )
+    .await
+}
+
+async fn start_socks_client_with_mode(
+    tunnel_addr: SocketAddr,
+    routing: RoutingConfig,
+    tunnel_path: &str,
+    client_secret: &str,
+    mode: TransportMode,
+) -> TestResult<RunningTask> {
     start_socks_client_with_dns(
         tunnel_addr,
         routing,
         tunnel_path,
         client_secret,
         ClientDnsConfig::default(),
+        mode,
     )
     .await
 }
@@ -452,11 +515,12 @@ async fn start_socks_client_with_dns(
     tunnel_path: &str,
     client_secret: &str,
     dns: ClientDnsConfig,
+    mode: TransportMode,
 ) -> TestResult<RunningTask> {
     let listen = free_addr().await?;
     let router = Router::new(routing);
     let tcp_transport = transport::build_tcp_transport(
-        TransportMode::RawTcp,
+        mode,
         outbound_config(tunnel_addr, tunnel_path),
         auth_config(client_secret),
         TimeoutsConfig::default(),
