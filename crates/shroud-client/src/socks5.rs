@@ -53,13 +53,20 @@ pub async fn serve(
                 active.spawn(async move {
                     let _permit = permit;
                     if let Err(err) = handle_connection(socket, peer, session).await {
-                        debug!(%peer, error = %err, "connection handling failed");
+                        debug!(
+                            %peer,
+                            error = format!("{err:#}"),
+                            "connection handling failed"
+                        );
                     }
                 });
             }
             result = active.join_next(), if !active.is_empty() => {
                 if let Some(Err(err)) = result {
-                    debug!(error = %err, "SOCKS5 connection task join failed");
+                    debug!(
+                        error = format!("{err:#}"),
+                        "SOCKS5 connection task join failed"
+                    );
                 }
             }
         }
@@ -69,7 +76,10 @@ pub async fn serve(
     let _ = timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
         while let Some(result) = active.join_next().await {
             if let Err(err) = result {
-                debug!(error = %err, "SOCKS5 connection task stopped during shutdown");
+                debug!(
+                    error = format!("{err:#}"),
+                    "SOCKS5 connection task stopped during shutdown"
+                );
             }
         }
     })

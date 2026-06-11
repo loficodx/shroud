@@ -395,6 +395,9 @@ impl AsyncRead for H2StreamIo {
 
                 buf.put_slice(&self.read_buf[..len]);
                 self.read_buf.advance(len);
+                if let Err(err) = self.recv.flow_control().release_capacity(len) {
+                    return Poll::Ready(Err(io::Error::other(err)));
+                }
                 return Poll::Ready(Ok(()));
             }
 
@@ -429,7 +432,7 @@ impl AsyncWrite for H2StreamIo {
         }
 
         let mut capacity = self.send.capacity();
-        if capacity == 0 {
+        while capacity == 0 {
             if !self.write_capacity_requested {
                 self.send.reserve_capacity(buf.len().min(MAX_H2_DATA_CHUNK));
                 self.write_capacity_requested = true;
@@ -446,8 +449,8 @@ impl AsyncWrite for H2StreamIo {
                 }
                 Poll::Pending => return Poll::Pending,
             };
-            self.write_capacity_requested = false;
         }
+        self.write_capacity_requested = false;
 
         let len = buf.len().min(capacity).min(MAX_H2_DATA_CHUNK);
         self.send
@@ -545,6 +548,7 @@ mod tests {
     use super::*;
     use shroud_core::config::ClientAuthConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
 
     const CLIENT_ID: &str = "11111111-1111-1111-1111-111111111111";
     const CLIENT_SECRET: &str = "test-secret";
@@ -657,5 +661,99 @@ mod tests {
         assert_eq!(&buf, b"pong");
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn h2_stream_io_relays_large_payload_without_flow_control_stall() {
+        let payload = vec![42u8; 256 * 1024];
+        assert!(payload.len() > 64 * 1024);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (mut client_sender, client_connection) =
+            h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            client_connection.await.unwrap();
+        });
+
+        let server_payload = payload.clone();
+        let server = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let handler = tokio::spawn(async move {
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+
+                let mut recv = request.into_body();
+                let mut received = Vec::with_capacity(server_payload.len());
+                while let Some(chunk) = recv.data().await {
+                    let chunk = chunk.unwrap();
+                    let len = chunk.len();
+                    received.extend_from_slice(&chunk);
+                    recv.flow_control().release_capacity(len).unwrap();
+                }
+                assert_eq!(received, server_payload);
+
+                send_all_h2_data(&mut send, Bytes::from(received), true).await;
+            });
+
+            let driver = tokio::spawn(async move {
+                while let Some(result) = server.accept().await {
+                    result.unwrap();
+                }
+            });
+
+            handler.await.unwrap();
+            driver.abort();
+        });
+
+        client_sender = client_sender.ready().await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/api/tunnel/h2")
+            .body(())
+            .unwrap();
+        let (response, send) = client_sender.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        let mut stream = H2StreamIo::new(send, response.into_body());
+
+        timeout(Duration::from_secs(5), stream.write_all(&payload))
+            .await
+            .expect("large HTTP/2 upload stalled")
+            .unwrap();
+        timeout(Duration::from_secs(5), stream.shutdown())
+            .await
+            .expect("HTTP/2 shutdown stalled")
+            .unwrap();
+
+        let mut received = Vec::with_capacity(payload.len());
+        timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+            .await
+            .expect("large HTTP/2 download stalled")
+            .unwrap();
+        assert_eq!(received, payload);
+
+        server.await.unwrap();
+    }
+
+    async fn send_all_h2_data(send: &mut SendStream<Bytes>, mut data: Bytes, end_stream: bool) {
+        while data.has_remaining() {
+            let desired = data.remaining().min(MAX_H2_DATA_CHUNK);
+            let mut capacity = send.capacity();
+            while capacity == 0 {
+                send.reserve_capacity(desired);
+                capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                    .await
+                    .expect("HTTP/2 response stream capacity closed")
+                    .expect("HTTP/2 response stream capacity failed");
+            }
+
+            let len = data.remaining().min(capacity).min(MAX_H2_DATA_CHUNK);
+            send.send_data(data.split_to(len), false).unwrap();
+        }
+
+        if end_stream {
+            send.send_data(Bytes::new(), true).unwrap();
+        }
     }
 }

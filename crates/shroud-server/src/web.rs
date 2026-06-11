@@ -119,13 +119,20 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                     };
 
                     if let Err(err) = result {
-                        debug!(%peer, error = %err, "failed to handle incoming connection");
+                        debug!(
+                            %peer,
+                            error = format!("{err:#}"),
+                            "failed to handle incoming connection"
+                        );
                     }
                 });
             }
             result = active.join_next(), if !active.is_empty() => {
                 if let Some(Err(err)) = result {
-                    debug!(error = %err, "server connection task join failed");
+                    debug!(
+                        error = format!("{err:#}"),
+                        "server connection task join failed"
+                    );
                 }
             }
         }
@@ -135,7 +142,10 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let _ = timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
         while let Some(result) = active.join_next().await {
             if let Err(err) = result {
-                debug!(error = %err, "server connection task stopped during shutdown");
+                debug!(
+                    error = format!("{err:#}"),
+                    "server connection task stopped during shutdown"
+                );
             }
         }
     })

@@ -63,13 +63,21 @@ where
                 let state = state.clone();
                 active.spawn(async move {
                     if let Err(err) = handle_http2_request(request, respond, peer, state).await {
-                        debug!(%peer, error = %err, "HTTP/2 stream handler failed");
+                        debug!(
+                            %peer,
+                            error = format!("{err:#}"),
+                            "HTTP/2 stream handler failed"
+                        );
                     }
                 });
             }
             result = active.join_next(), if !active.is_empty() => {
                 if let Some(Err(err)) = result {
-                    debug!(%peer, error = %err, "HTTP/2 stream task join failed");
+                    debug!(
+                        %peer,
+                        error = format!("{err:#}"),
+                        "HTTP/2 stream task join failed"
+                    );
                 }
             }
         }
@@ -77,7 +85,11 @@ where
 
     while let Some(result) = active.join_next().await {
         if let Err(err) = result {
-            debug!(%peer, error = %err, "HTTP/2 stream task join failed");
+            debug!(
+                %peer,
+                error = format!("{err:#}"),
+                "HTTP/2 stream task join failed"
+            );
         }
     }
 
@@ -308,11 +320,16 @@ async fn relay_http2_stream(
         let mut bytes = 0u64;
         while let Some(chunk) = request_body.data().await {
             let chunk = chunk.context("failed to read HTTP/2 request body")?;
-            bytes = bytes.saturating_add(chunk.len() as u64);
+            let len = chunk.len();
+            bytes = bytes.saturating_add(len as u64);
             target_write
                 .write_all(&chunk)
                 .await
                 .context("failed to write HTTP/2 body chunk to target")?;
+            request_body
+                .flow_control()
+                .release_capacity(len)
+                .context("failed to release HTTP/2 request body capacity")?;
         }
         target_write
             .shutdown()
@@ -399,7 +416,7 @@ async fn send_h2_data(
     while data.has_remaining() {
         let desired = data.remaining().min(MAX_H2_DATA_CHUNK);
         let mut capacity = send.capacity();
-        if capacity == 0 {
+        while capacity == 0 {
             send.reserve_capacity(desired);
             capacity = poll_fn(|cx| send.poll_capacity(cx))
                 .await
@@ -571,6 +588,7 @@ mod tests {
         AuthorizedClient, RelayConfig, ServerSecurityConfig, ServerTlsConfig,
         ServerTransportConfig, TimeoutsConfig, TransportMode,
     };
+    use tokio::time::timeout;
 
     const CLIENT_ID: &str = "11111111-1111-1111-1111-111111111111";
     const CLIENT_SECRET: &str = "test-secret";
@@ -615,7 +633,7 @@ mod tests {
             cfg(),
         ));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
-        let connection = tokio::spawn(async move { connection.await.unwrap() });
+        let connection = tokio::spawn(async move { connection.await });
 
         client = client.ready().await.unwrap();
         let request = Request::builder()
@@ -631,7 +649,7 @@ mod tests {
         drop(response);
         drop(send);
         drop(client);
-        connection.await.unwrap();
+        connection.await.unwrap().unwrap();
         server.await.unwrap().unwrap();
     }
 
@@ -694,6 +712,83 @@ mod tests {
         drop(client);
         connection.await.unwrap();
         assert_eq!(server.await.unwrap(), (4, 4));
+        target.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relays_large_http2_response_without_flow_control_stall() {
+        let payload = vec![7u8; 256 * 1024];
+        assert!(payload.len() > 64 * 1024);
+
+        let (target_for_relay, mut target_peer) = tokio::io::duplex(4096);
+        let target_payload = payload.clone();
+        let target = tokio::spawn(async move {
+            target_peer.write_all(&target_payload).await.unwrap();
+            target_peer.shutdown().await.unwrap();
+        });
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let handler = tokio::spawn(async move {
+                let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let send = respond.send_response(response, false).unwrap();
+                relay_http2_stream(request.into_body(), send, target_for_relay)
+                    .await
+                    .unwrap()
+            });
+
+            let driver = tokio::spawn(async move {
+                while let Some(result) = server.accept().await {
+                    result.unwrap();
+                }
+            });
+
+            let result = handler.await.unwrap();
+            (result, driver)
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let connection = tokio::spawn(async move { connection.await.unwrap() });
+
+        client = client.ready().await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://localhost/api/tunnel/h2")
+            .body(())
+            .unwrap();
+        let (response, _send) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let mut received = Vec::with_capacity(payload.len());
+        timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                let len = chunk.len();
+                received.extend_from_slice(&chunk);
+                body.flow_control().release_capacity(len).unwrap();
+            }
+        })
+        .await
+        .expect("large HTTP/2 response stalled");
+        assert_eq!(received, payload);
+
+        let (relay_result, driver) = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("large HTTP/2 relay task stalled")
+            .unwrap();
+        assert_eq!(relay_result, (0, payload.len() as u64));
+        driver.abort();
+        let _ = driver.await;
+
+        drop(body);
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("HTTP/2 client connection task stalled")
+            .unwrap();
         target.await.unwrap();
     }
 }
