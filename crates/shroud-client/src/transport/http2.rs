@@ -18,6 +18,7 @@ use std::io;
 use std::net::Ipv6Addr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,6 +32,7 @@ use tracing::{debug, info, warn};
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
 const H2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+const H2_CONNECTION_POOL_SIZE: usize = 4;
 
 #[derive(Clone)]
 pub struct Http2Transport {
@@ -38,7 +40,7 @@ pub struct Http2Transport {
     auth: ClientAuthConfig,
     tls: Http2Tls,
     timeouts: Http2ClientTimeouts,
-    shared: Arc<Mutex<Option<Http2SharedConnection>>>,
+    pool: Arc<Http2ConnectionPool>,
 }
 
 #[derive(Clone)]
@@ -47,8 +49,13 @@ struct Http2Tls {
     server_name: ServerName<'static>,
 }
 
+struct Http2ConnectionPool {
+    next: AtomicUsize,
+    slots: Vec<Mutex<Option<Http2PooledConnection>>>,
+}
+
 #[derive(Clone)]
-struct Http2SharedConnection {
+struct Http2PooledConnection {
     sender: SendRequest<Bytes>,
 }
 
@@ -99,6 +106,9 @@ impl Http2Transport {
             server = %outbound.server,
             port = outbound.port,
             tls = outbound.tls,
+            pool_size = H2_CONNECTION_POOL_SIZE,
+            stream_window = H2_INITIAL_STREAM_WINDOW,
+            connection_window = H2_INITIAL_CONNECTION_WINDOW,
             "selected HTTP/2 transport mode"
         );
 
@@ -107,19 +117,21 @@ impl Http2Transport {
             auth,
             tls,
             timeouts,
-            shared: Arc::new(Mutex::new(None)),
+            pool: Arc::new(Http2ConnectionPool::new(H2_CONNECTION_POOL_SIZE)),
         })
     }
 
     async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpTransportConnect> {
+        let pool_index = self.pool.next_index();
         info!(
             target = %format_target(target_host, target_port),
+            pool_index,
             "opening HTTP/2 stream"
         );
 
         let mut last_retryable = None;
         for attempt in 0..2 {
-            let (mut sender, metrics) = self.get_or_open_connection().await?;
+            let (mut sender, metrics) = self.get_or_open_connection(pool_index).await?;
             match self
                 .open_stream_once(&mut sender, target_host, target_port)
                 .await
@@ -127,6 +139,7 @@ impl Http2Transport {
                 Ok(opened) => {
                     info!(
                         target = %format_target(target_host, target_port),
+                        pool_index,
                         "HTTP/2 stream established"
                     );
                     return Ok(TcpTransportConnect {
@@ -137,6 +150,7 @@ impl Http2Transport {
                 Err(OpenStreamError::Fatal(err)) => {
                     warn!(
                         target = %format_target(target_host, target_port),
+                        pool_index,
                         error = %err,
                         "HTTP/2 stream failed"
                     );
@@ -145,11 +159,12 @@ impl Http2Transport {
                 Err(OpenStreamError::Retryable(err)) => {
                     warn!(
                         target = %format_target(target_host, target_port),
+                        pool_index,
                         attempt,
                         error = %err,
                         "HTTP/2 stream failed"
                     );
-                    self.clear_connection().await;
+                    self.clear_connection(pool_index).await;
                     last_retryable = Some(err);
                 }
             }
@@ -158,35 +173,40 @@ impl Http2Transport {
         let err = last_retryable.unwrap_or_else(|| anyhow!("HTTP/2 stream open failed"));
         warn!(
             target = %format_target(target_host, target_port),
+            pool_index,
             error = %err,
             "HTTP/2 stream failed"
         );
         Err(err)
     }
 
-    async fn get_or_open_connection(&self) -> Result<(SendRequest<Bytes>, TcpTransportMetrics)> {
-        let mut shared = self.shared.lock().await;
-        if let Some(connection) = shared.as_ref() {
+    async fn get_or_open_connection(
+        &self,
+        pool_index: usize,
+    ) -> Result<(SendRequest<Bytes>, TcpTransportMetrics)> {
+        let mut slot = self.pool.slots[pool_index].lock().await;
+        if let Some(connection) = slot.as_ref() {
             return Ok((connection.sender.clone(), TcpTransportMetrics::default()));
         }
 
-        let connection = self.open_connection().await?;
+        let connection = self.open_connection(pool_index).await?;
         let sender = connection.sender.clone();
         let metrics = connection.metrics;
-        *shared = Some(Http2SharedConnection {
+        *slot = Some(Http2PooledConnection {
             sender: connection.sender,
         });
         Ok((sender, metrics))
     }
 
-    async fn clear_connection(&self) {
-        *self.shared.lock().await = None;
+    async fn clear_connection(&self, pool_index: usize) {
+        *self.pool.slots[pool_index].lock().await = None;
     }
 
-    async fn open_connection(&self) -> Result<Http2Connection> {
+    async fn open_connection(&self, pool_index: usize) -> Result<Http2Connection> {
         info!(
             server = %self.outbound.server,
             port = self.outbound.port,
+            pool_index,
             "opening HTTP/2 connection to server"
         );
 
@@ -252,13 +272,18 @@ impl Http2Transport {
 
         tokio::spawn(async move {
             if let Err(err) = connection.await {
-                debug!(error = %err, "HTTP/2 client connection closed with error");
+                debug!(
+                    pool_index,
+                    error = %err,
+                    "HTTP/2 client connection closed with error"
+                );
             }
         });
 
         info!(
             server = %self.outbound.server,
             port = self.outbound.port,
+            pool_index,
             server_tcp_connect_ms,
             tls_handshake_ms,
             stream_window = H2_INITIAL_STREAM_WINDOW,
@@ -334,6 +359,21 @@ impl Http2Transport {
             .header(HEADER_TARGET_PORT, target_port.to_string())
             .body(())
             .context("failed to build HTTP/2 tunnel request")
+    }
+}
+
+impl Http2ConnectionPool {
+    fn new(size: usize) -> Self {
+        assert!(size > 0, "HTTP/2 connection pool size must be non-zero");
+        let slots = (0..size).map(|_| Mutex::new(None)).collect();
+        Self {
+            next: AtomicUsize::new(0),
+            slots,
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len()
     }
 }
 
@@ -616,6 +656,20 @@ mod tests {
         assert!(request.headers().contains_key(HEADER_TIMESTAMP));
         assert!(request.headers().contains_key(HEADER_NONCE));
         assert!(request.headers().contains_key(HEADER_AUTH));
+    }
+
+    #[test]
+    fn connection_pool_indexes_are_round_robin() {
+        let pool = Http2ConnectionPool::new(H2_CONNECTION_POOL_SIZE);
+
+        let indexes = (0..(H2_CONNECTION_POOL_SIZE + 2))
+            .map(|_| pool.next_index())
+            .collect::<Vec<_>>();
+        let expected = (0..(H2_CONNECTION_POOL_SIZE + 2))
+            .map(|index| index % H2_CONNECTION_POOL_SIZE)
+            .collect::<Vec<_>>();
+
+        assert_eq!(indexes, expected);
     }
 
     #[tokio::test]
