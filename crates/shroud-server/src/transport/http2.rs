@@ -28,6 +28,8 @@ const NONCE_LEN: usize = 16;
 const NONCE_HEADER_LEN: usize = 22;
 const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
+const H2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+const H2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 pub async fn handle_http2_connection<S>(
     stream: S,
@@ -37,7 +39,12 @@ pub async fn handle_http2_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut connection = match h2::server::handshake(stream).await {
+    let mut connection = match h2::server::Builder::new()
+        .initial_window_size(H2_INITIAL_STREAM_WINDOW)
+        .initial_connection_window_size(H2_INITIAL_CONNECTION_WINDOW)
+        .handshake(stream)
+        .await
+    {
         Ok(connection) => connection,
         Err(err) => {
             warn!(
@@ -48,7 +55,12 @@ where
             return Err(err).context("failed to establish HTTP/2 server connection");
         }
     };
-    info!(%peer, "accepted HTTP/2 connection");
+    info!(
+        %peer,
+        stream_window = H2_INITIAL_STREAM_WINDOW,
+        connection_window = H2_INITIAL_CONNECTION_WINDOW,
+        "accepted HTTP/2 connection"
+    );
 
     let state = Arc::new(Http2ServerState::new(cfg));
     let mut active = JoinSet::new();

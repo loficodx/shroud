@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-// cargo run -p shroud-client -- configs/client.yaml
+// cargo run -p shroud-client --release client-laptop.yaml
 
 //DNS remote resolve
 // curl --socks5-hostname 127.0.0.1:1080 https://example.com

@@ -29,6 +29,8 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::{debug, info, warn};
 
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
+const H2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+const H2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Http2Transport {
@@ -237,10 +239,16 @@ impl Http2Transport {
         })?;
         let tls_handshake_ms = elapsed_millis(tls_started.elapsed());
 
-        let (sender, connection) = timeout(self.timeouts.h2_handshake, h2::client::handshake(tls))
-            .await
-            .context("timed out establishing HTTP/2 client connection")?
-            .context("failed to establish HTTP/2 client connection")?;
+        let (sender, connection) = timeout(
+            self.timeouts.h2_handshake,
+            h2::client::Builder::new()
+                .initial_window_size(H2_INITIAL_STREAM_WINDOW)
+                .initial_connection_window_size(H2_INITIAL_CONNECTION_WINDOW)
+                .handshake(tls),
+        )
+        .await
+        .context("timed out establishing HTTP/2 client connection")?
+        .context("failed to establish HTTP/2 client connection")?;
 
         tokio::spawn(async move {
             if let Err(err) = connection.await {
@@ -253,6 +261,8 @@ impl Http2Transport {
             port = self.outbound.port,
             server_tcp_connect_ms,
             tls_handshake_ms,
+            stream_window = H2_INITIAL_STREAM_WINDOW,
+            connection_window = H2_INITIAL_CONNECTION_WINDOW,
             "HTTP/2 connection established"
         );
 
