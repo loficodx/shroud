@@ -31,6 +31,23 @@ const NONCE_HEADER_LEN: usize = 22;
 const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptedProtocol {
+    H2,
+    Http1,
+    Unknown,
+}
+
+impl AcceptedProtocol {
+    fn from_alpn(alpn: Option<&[u8]>) -> Self {
+        match alpn {
+            Some(b"h2") => Self::H2,
+            Some(b"http/1.1") => Self::Http1,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_alpn = if cfg.transport.modes.contains(&TransportMode::Http2) {
@@ -97,12 +114,24 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                 Err(anyhow!("tls handshake timed out"))
                             }
                             Ok(Ok(stream)) => {
+                                let accepted_protocol = AcceptedProtocol::from_alpn(
+                                    stream.get_ref().1.alpn_protocol(),
+                                );
                                 debug!(
                                     %peer,
                                     tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
+                                    ?accepted_protocol,
                                     "server TLS handshake finished"
                                 );
-                                handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
+                                handle_connection(
+                                    stream,
+                                    peer,
+                                    cfg,
+                                    nonce_cache,
+                                    raw_tcp_state,
+                                    accepted_protocol,
+                                )
+                                .await
                             }
                             Ok(Err(err)) => {
                                 warn!(
@@ -115,7 +144,15 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                             }
                         }
                     } else {
-                        handle_connection(stream, peer, cfg, nonce_cache, raw_tcp_state).await
+                        handle_connection(
+                            stream,
+                            peer,
+                            cfg,
+                            nonce_cache,
+                            raw_tcp_state,
+                            AcceptedProtocol::Unknown,
+                        )
+                        .await
                     };
 
                     if let Err(err) = result {
@@ -160,12 +197,14 @@ async fn handle_connection<S>(
     cfg: ServerConfig,
     nonce_cache: Arc<NonceCache>,
     raw_tcp_state: RawTcpServerState,
+    accepted_protocol: AcceptedProtocol,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let raw_tcp_enabled = cfg.transport.modes.contains(&TransportMode::RawTcp);
     let http2_enabled = cfg.transport.modes.contains(&TransportMode::Http2);
-    if cfg.transport.modes.contains(&TransportMode::RawTcp) {
+    if raw_tcp_enabled {
         let (stream, is_raw_tcp) = sniff_raw_tcp_magic(
             stream,
             Duration::from_millis(cfg.timeouts.raw_tcp_handshake_ms),
@@ -174,15 +213,14 @@ where
         if is_raw_tcp {
             return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
         }
-        if http2_enabled {
+        if http2_enabled && accepted_protocol == AcceptedProtocol::H2 {
             return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
         }
 
-        debug!(%peer, "rejecting unsupported server protocol");
-        bail!("unsupported server protocol");
+        return handle_http_connection(stream, peer, cfg, nonce_cache).await;
     }
 
-    if http2_enabled {
+    if http2_enabled && accepted_protocol == AcceptedProtocol::H2 {
         return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
     }
 
@@ -761,6 +799,7 @@ mod tests {
         AuthorizedClient, ServerSecurityConfig, ServerTlsConfig, ServerTransportConfig,
         TransportMode,
     };
+    use shroud_core::tcp_handshake::{TcpConnectStatus, read_raw_tcp_connect_status};
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -814,29 +853,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_rejects_non_raw_tcp_prefix_when_raw_tcp_is_enabled() {
+    async fn handle_connection_dispatches_raw_magic_to_raw_tcp_when_http2_is_enabled() {
         let web_root = TempWebRoot::new();
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let cfg = ServerConfig {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            tunnel_path: "/api/tunnel".to_string(),
-            web_root: web_root.path.to_string_lossy().into_owned(),
-            logging: Default::default(),
-            transport: Default::default(),
-            tls: ServerTlsConfig::default(),
-            timeouts: Default::default(),
-            relay: Default::default(),
-            limits: Default::default(),
-            security: ServerSecurityConfig::default(),
-            clients: vec![AuthorizedClient {
-                name: None,
-                client_id: "11111111-1111-1111-1111-111111111111".to_string(),
-                client_secret: "test-secret".to_string(),
-                created_at: None,
-            }],
-        };
+        let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
-        let raw_tcp_state = RawTcpServerState::new(cfg.clients.clone());
+        let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
             handle_connection(
@@ -845,61 +867,39 @@ mod tests {
                 cfg,
                 nonce_cache,
                 raw_tcp_state,
+                AcceptedProtocol::H2,
             )
             .await
         });
 
         client
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(&RAW_TCP_MAGIC)
             .await
-            .expect("write request");
-        client.shutdown().await.expect("shutdown request");
+            .expect("write raw_tcp magic");
+        client.shutdown().await.expect("shutdown raw_tcp request");
 
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
+        let status = read_raw_tcp_connect_status(&mut client)
             .await
-            .expect("read response");
+            .expect("read raw_tcp status");
         let err = handle
             .await
             .expect("join handler")
-            .expect_err("non-raw_tcp prefix should be rejected");
+            .expect_err("incomplete raw_tcp request should fail in raw_tcp handler");
 
-        assert!(response.is_empty());
-        assert!(err.to_string().contains("unsupported server protocol"));
+        assert_eq!(status, TcpConnectStatus::InvalidRequest);
+        assert!(
+            err.to_string()
+                .contains("failed to read raw_tcp connect request")
+        );
     }
 
     #[tokio::test]
-    async fn handle_connection_dispatches_non_raw_tcp_prefix_to_http2_when_enabled() {
+    async fn handle_connection_dispatches_non_raw_tcp_prefix_to_http2_with_h2_protocol() {
         let web_root = TempWebRoot::new();
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let cfg = ServerConfig {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            tunnel_path: "/api/tunnel".to_string(),
-            web_root: web_root.path.to_string_lossy().into_owned(),
-            logging: Default::default(),
-            transport: ServerTransportConfig {
-                modes: vec![TransportMode::RawTcp, TransportMode::Http2],
-            },
-            tls: ServerTlsConfig::default(),
-            timeouts: Default::default(),
-            relay: Default::default(),
-            limits: Default::default(),
-            security: ServerSecurityConfig::default(),
-            clients: vec![AuthorizedClient {
-                name: None,
-                client_id: "11111111-1111-1111-1111-111111111111".to_string(),
-                client_secret: "test-secret".to_string(),
-                created_at: None,
-            }],
-        };
+        let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
-        let raw_tcp_state = RawTcpServerState::with_relay_config(
-            cfg.clients.clone(),
-            cfg.timeouts,
-            cfg.security.clone(),
-            cfg.relay,
-        );
+        let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
             handle_connection(
@@ -908,6 +908,7 @@ mod tests {
                 cfg,
                 nonce_cache,
                 raw_tcp_state,
+                AcceptedProtocol::H2,
             )
             .await
         });
@@ -932,6 +933,102 @@ mod tests {
 
         connection.await.unwrap();
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_dispatches_http1_to_fallback_when_raw_tcp_and_http2_enabled() {
+        let web_root = TempWebRoot::new();
+        web_root.write("index.html", b"fallback index");
+
+        let (response, result) = run_dispatch_http_request(
+            &web_root,
+            vec![TransportMode::RawTcp, TransportMode::Http2],
+            AcceptedProtocol::Http1,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        result.expect("handler should use HTTP/1.1 fallback");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("{\"status\":\"ok\"}\n"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_dispatches_raw_tcp_only_http1_request_to_http_fallback() {
+        let web_root = TempWebRoot::new();
+        web_root.write("index.html", b"fallback index");
+
+        let (response, result) = run_dispatch_http_request(
+            &web_root,
+            vec![TransportMode::RawTcp],
+            AcceptedProtocol::Unknown,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        result.expect("handler should use HTTP/1.1 fallback");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("{\"status\":\"ok\"}\n"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_dispatches_http2_only_h2_protocol_to_http2() {
+        let web_root = TempWebRoot::new();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let cfg = test_config(&web_root, vec![TransportMode::Http2]);
+        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
+        let raw_tcp_state = test_raw_tcp_state(&cfg);
+
+        let handle = tokio::spawn(async move {
+            handle_connection(
+                server,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+                cfg,
+                nonce_cache,
+                raw_tcp_state,
+                AcceptedProtocol::H2,
+            )
+            .await
+        });
+
+        let (mut h2_client, connection) = h2::client::handshake(client).await.unwrap();
+        let connection = tokio::spawn(async move { connection.await.unwrap() });
+
+        h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://localhost/api/tunnel/h2")
+            .body(())
+            .unwrap();
+        let (response, mut send) = h2_client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        send.send_data(bytes::Bytes::new(), true).ok();
+        drop(response);
+        drop(send);
+        drop(h2_client);
+
+        connection.await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_dispatches_unknown_protocol_to_http_fallback() {
+        let web_root = TempWebRoot::new();
+        web_root.write("index.html", b"fallback index");
+
+        let (response, result) = run_dispatch_http_request(
+            &web_root,
+            vec![TransportMode::Http2],
+            AcceptedProtocol::Unknown,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        result.expect("handler should use HTTP/1.1 fallback");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("{\"status\":\"ok\"}\n"));
     }
 
     #[tokio::test]
@@ -1143,14 +1240,13 @@ mod tests {
         }
     }
 
-    async fn run_request(web_root: &TempWebRoot, request: &str) -> String {
-        let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let cfg = ServerConfig {
+    fn test_config(web_root: &TempWebRoot, modes: Vec<TransportMode>) -> ServerConfig {
+        ServerConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tunnel_path: "/api/tunnel".to_string(),
             web_root: web_root.path.to_string_lossy().into_owned(),
             logging: Default::default(),
-            transport: Default::default(),
+            transport: ServerTransportConfig { modes },
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),
             relay: Default::default(),
@@ -1162,7 +1258,60 @@ mod tests {
                 client_secret: "test-secret".to_string(),
                 created_at: None,
             }],
-        };
+        }
+    }
+
+    fn test_raw_tcp_state(cfg: &ServerConfig) -> RawTcpServerState {
+        RawTcpServerState::with_relay_config(
+            cfg.clients.clone(),
+            cfg.timeouts,
+            cfg.security.clone(),
+            cfg.relay,
+        )
+    }
+
+    async fn run_dispatch_http_request(
+        web_root: &TempWebRoot,
+        modes: Vec<TransportMode>,
+        accepted_protocol: AcceptedProtocol,
+        request: &str,
+    ) -> (String, Result<()>) {
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let cfg = test_config(web_root, modes);
+        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
+        let raw_tcp_state = test_raw_tcp_state(&cfg);
+
+        let handle = tokio::spawn(async move {
+            handle_connection(
+                server,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+                cfg,
+                nonce_cache,
+                raw_tcp_state,
+                accepted_protocol,
+            )
+            .await
+        });
+
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        client.shutdown().await.expect("shutdown request");
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+
+        let result = handle.await.expect("join handler");
+        (String::from_utf8_lossy(&response).into_owned(), result)
+    }
+
+    async fn run_request(web_root: &TempWebRoot, request: &str) -> String {
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let cfg = test_config(web_root, vec![TransportMode::RawTcp]);
         let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
 
         let handle = tokio::spawn(async move {
