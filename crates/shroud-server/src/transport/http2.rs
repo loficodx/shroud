@@ -347,7 +347,7 @@ async fn relay_http2_stream(
 
     let upload_last_activity_ms = last_activity_ms.clone();
     let upload_diagnostics_for_task = upload_diagnostics.clone();
-    let upload = tokio::spawn(async move {
+    let mut upload = Some(tokio::spawn(async move {
         let mut request_body = request_body;
         while let Some(chunk) = request_body.data().await {
             let chunk = chunk.context("failed to read HTTP/2 request body")?;
@@ -368,11 +368,11 @@ async fn relay_http2_stream(
             .await
             .context("failed to shutdown target write half after HTTP/2 EOF")?;
         Ok::<(), anyhow::Error>(())
-    });
+    }));
 
     let download_last_activity_ms = last_activity_ms.clone();
     let download_bytes_for_task = download_bytes.clone();
-    let download = tokio::spawn(async move {
+    let mut download = Some(tokio::spawn(async move {
         let mut response_body = response_body;
         let mut buf = vec![0u8; MAX_H2_DATA_CHUNK];
         loop {
@@ -391,43 +391,56 @@ async fn relay_http2_stream(
             download_bytes_for_task.fetch_add(n as u64, Ordering::Relaxed);
             mark_activity(&download_last_activity_ms, started);
         }
-    });
+    }));
     let idle = idle_watchdog(started, last_activity_ms, idle_timeout);
 
-    tokio::pin!(upload);
-    tokio::pin!(download);
     tokio::pin!(idle);
 
-    let mut upload_done = false;
     loop {
         tokio::select! {
             () = &mut idle => {
-                upload.abort();
-                download.abort();
-                let _ = upload.await;
-                let _ = download.await;
+                if let Some(upload) = upload.take() {
+                    upload.abort();
+                    let _ = upload.await;
+                }
+                if let Some(download) = download.take() {
+                    download.abort();
+                    let _ = download.await;
+                }
                 return Ok(Http2RelayStats::from_counters(
                     &upload_diagnostics,
                     download_bytes.load(Ordering::Relaxed),
                     RelayCloseReason::IdleTimeout,
                 ));
             }
-            upload_result = &mut upload, if !upload_done => {
+            upload_result = async {
+                upload
+                    .as_mut()
+                    .expect("upload task must exist while select branch is enabled")
+                    .await
+            }, if upload.is_some() => {
+                let _completed_upload = upload.take();
                 match flatten_join_result(upload_result, "HTTP/2 upload task") {
-                    Ok(()) => {
-                        upload_done = true;
-                    }
+                    Ok(()) => {}
                     Err(err) => {
-                        download.abort();
-                        let _ = download.await;
+                        if let Some(download) = download.take() {
+                            download.abort();
+                            let _ = download.await;
+                        }
                         return Err(err);
                     }
                 }
             }
-            download_result = &mut download => {
+            download_result = async {
+                download
+                    .as_mut()
+                    .expect("download task must exist while select branch is enabled")
+                    .await
+            }, if download.is_some() => {
+                let _completed_download = download.take();
                 match flatten_join_result(download_result, "HTTP/2 download task") {
                     Ok(()) => {
-                        if !upload_done {
+                        if let Some(upload) = upload.take() {
                             upload.abort();
                             let _ = upload.await;
                         }
@@ -438,8 +451,10 @@ async fn relay_http2_stream(
                         ));
                     }
                     Err(err) => {
-                        upload.abort();
-                        let _ = upload.await;
+                        if let Some(upload) = upload.take() {
+                            upload.abort();
+                            let _ = upload.await;
+                        }
                         return Err(err);
                     }
                 }
