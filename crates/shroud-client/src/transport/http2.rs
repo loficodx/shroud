@@ -29,6 +29,9 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::{debug, info, warn};
 
+// MVP HTTP/2 tuning defaults.
+// Keep client/server window sizes in sync.
+// Do not change chunk/window sizes without running raw_tcp/http2 benchmark matrix.
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
 const H2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;

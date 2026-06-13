@@ -28,6 +28,10 @@ const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
 const NONCE_LEN: usize = 16;
 const NONCE_HEADER_LEN: usize = 22;
 const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
+
+// MVP HTTP/2 tuning defaults.
+// Keep client/server window sizes in sync.
+// Do not change chunk/window sizes without running raw_tcp/http2 benchmark matrix.
 const MAX_H2_DATA_CHUNK: usize = 16 * 1024;
 const H2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
