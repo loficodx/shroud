@@ -11,12 +11,13 @@ use shroud_core::http2_protocol::{
     DEFAULT_TUNNEL_PATH, HEADER_AUTH, HEADER_CLIENT_ID, HEADER_NONCE, HEADER_TARGET_HOST,
     HEADER_TARGET_PORT, HEADER_TIMESTAMP, LEGACY_TUNNEL_PATH,
 };
+use shroud_core::relay::RelayCloseReason;
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -224,8 +225,13 @@ async fn handle_http2_request(
         .send_response(response, false)
         .context("failed to send HTTP/2 OK response")?;
 
-    let (upload_bytes, download_bytes) =
-        relay_http2_stream(request.into_body(), send, target).await?;
+    let relay_stats = relay_http2_stream(
+        request.into_body(),
+        send,
+        target,
+        Duration::from_secs(state.cfg.timeouts.idle_timeout_sec),
+    )
+    .await?;
 
     debug!(
         %peer,
@@ -233,9 +239,12 @@ async fn handle_http2_request(
         target = %format_target(&metadata.target_host, metadata.target_port),
         target_tcp_connect_ms,
         duration_ms = elapsed_millis(started.elapsed()),
-        bytes_up = upload_bytes,
-        bytes_down = download_bytes,
-        close_reason = "closed",
+        bytes_up = relay_stats.upload_bytes,
+        bytes_down = relay_stats.download_bytes,
+        upload_chunks = relay_stats.upload_chunks,
+        upload_max_chunk_size = relay_stats.upload_max_chunk_size,
+        upload_avg_chunk_size = relay_stats.upload_avg_chunk_size,
+        close_reason = relay_stats.close_reason.as_str(),
         "HTTP/2 stream closed"
     );
 
@@ -324,20 +333,27 @@ async fn relay_http2_stream(
     request_body: RecvStream,
     response_body: SendStream<Bytes>,
     target: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-) -> Result<(u64, u64)> {
+    idle_timeout: Duration,
+) -> Result<Http2RelayStats> {
     let (mut target_read, mut target_write) = tokio::io::split(target);
+    let started = Instant::now();
+    let last_activity_ms = Arc::new(AtomicU64::new(0));
+    let upload_diagnostics = Arc::new(Http2UploadDiagnostics::default());
+    let download_bytes = Arc::new(AtomicU64::new(0));
 
+    let upload_last_activity_ms = last_activity_ms.clone();
+    let upload_diagnostics_for_task = upload_diagnostics.clone();
     let upload = tokio::spawn(async move {
         let mut request_body = request_body;
-        let mut bytes = 0u64;
         while let Some(chunk) = request_body.data().await {
             let chunk = chunk.context("failed to read HTTP/2 request body")?;
             let len = chunk.len();
-            bytes = bytes.saturating_add(len as u64);
             target_write
                 .write_all(&chunk)
                 .await
                 .context("failed to write HTTP/2 body chunk to target")?;
+            upload_diagnostics_for_task.record_chunk(len);
+            mark_activity(&upload_last_activity_ms, started);
             request_body
                 .flow_control()
                 .release_capacity(len)
@@ -347,12 +363,13 @@ async fn relay_http2_stream(
             .shutdown()
             .await
             .context("failed to shutdown target write half after HTTP/2 EOF")?;
-        Ok::<u64, anyhow::Error>(bytes)
+        Ok::<(), anyhow::Error>(())
     });
 
+    let download_last_activity_ms = last_activity_ms.clone();
+    let download_bytes_for_task = download_bytes.clone();
     let download = tokio::spawn(async move {
         let mut response_body = response_body;
-        let mut bytes = 0u64;
         let mut buf = vec![0u8; MAX_H2_DATA_CHUNK];
         loop {
             let n = target_read
@@ -361,63 +378,136 @@ async fn relay_http2_stream(
                 .context("failed to read from target for HTTP/2 response body")?;
             if n == 0 {
                 send_h2_data(&mut response_body, Bytes::new(), true).await?;
-                return Ok::<u64, anyhow::Error>(bytes);
+                return Ok::<(), anyhow::Error>(());
             }
 
-            bytes = bytes.saturating_add(n as u64);
             send_h2_data(&mut response_body, Bytes::copy_from_slice(&buf[..n]), false)
                 .await
                 .context("failed to send target bytes to HTTP/2 response body")?;
+            download_bytes_for_task.fetch_add(n as u64, Ordering::Relaxed);
+            mark_activity(&download_last_activity_ms, started);
         }
     });
+    let idle = idle_watchdog(started, last_activity_ms, idle_timeout);
 
     tokio::pin!(upload);
     tokio::pin!(download);
+    tokio::pin!(idle);
 
-    let (upload_bytes, download_bytes) = tokio::select! {
-        upload_result = &mut upload => {
-            match flatten_join_result(upload_result, "HTTP/2 upload task") {
-                Ok(upload_bytes) => {
-                    let download_bytes = flatten_join_result(download.await, "HTTP/2 download task")?;
-                    (upload_bytes, download_bytes)
+    let mut upload_done = false;
+    loop {
+        tokio::select! {
+            () = &mut idle => {
+                upload.abort();
+                download.abort();
+                let _ = upload.await;
+                let _ = download.await;
+                return Ok(Http2RelayStats::from_counters(
+                    &upload_diagnostics,
+                    download_bytes.load(Ordering::Relaxed),
+                    RelayCloseReason::IdleTimeout,
+                ));
+            }
+            upload_result = &mut upload, if !upload_done => {
+                match flatten_join_result(upload_result, "HTTP/2 upload task") {
+                    Ok(()) => {
+                        upload_done = true;
+                    }
+                    Err(err) => {
+                        download.abort();
+                        let _ = download.await;
+                        return Err(err);
+                    }
                 }
-                Err(err) => {
-                    download.abort();
-                    let _ = download.await;
-                    return Err(err);
+            }
+            download_result = &mut download => {
+                match flatten_join_result(download_result, "HTTP/2 download task") {
+                    Ok(()) => {
+                        if !upload_done {
+                            upload.abort();
+                            let _ = upload.await;
+                        }
+                        return Ok(Http2RelayStats::from_counters(
+                            &upload_diagnostics,
+                            download_bytes.load(Ordering::Relaxed),
+                            RelayCloseReason::Closed,
+                        ));
+                    }
+                    Err(err) => {
+                        upload.abort();
+                        let _ = upload.await;
+                        return Err(err);
+                    }
                 }
             }
         }
-        download_result = &mut download => {
-            match flatten_join_result(download_result, "HTTP/2 download task") {
-                Ok(download_bytes) => {
-                    let upload_bytes = finish_or_abort_upload(upload).await?;
-                    (upload_bytes, download_bytes)
-                }
-                Err(err) => {
-                    upload.abort();
-                    let _ = upload.await;
-                    return Err(err);
-                }
-            }
-        }
-    };
-
-    Ok((upload_bytes, download_bytes))
+    }
 }
 
-async fn finish_or_abort_upload(
-    upload: Pin<&mut tokio::task::JoinHandle<Result<u64>>>,
-) -> Result<u64> {
-    if upload.is_finished() {
-        return flatten_join_result(upload.await, "HTTP/2 upload task");
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Http2RelayStats {
+    upload_bytes: u64,
+    download_bytes: u64,
+    close_reason: RelayCloseReason,
+    upload_chunks: u64,
+    upload_max_chunk_size: usize,
+    upload_avg_chunk_size: u64,
+}
 
-    upload.abort();
-    match upload.await {
-        Err(err) if err.is_cancelled() => Ok(0),
-        result => flatten_join_result(result, "HTTP/2 upload task"),
+impl Http2RelayStats {
+    fn from_counters(
+        upload: &Http2UploadDiagnostics,
+        download_bytes: u64,
+        close_reason: RelayCloseReason,
+    ) -> Self {
+        let upload_bytes = upload.bytes.load(Ordering::Relaxed);
+        let upload_chunks = upload.chunks.load(Ordering::Relaxed);
+        Self {
+            upload_bytes,
+            download_bytes,
+            close_reason,
+            upload_chunks,
+            upload_max_chunk_size: upload.max_chunk_size.load(Ordering::Relaxed),
+            upload_avg_chunk_size: if upload_chunks == 0 {
+                0
+            } else {
+                upload_bytes / upload_chunks
+            },
+        }
     }
+}
+
+#[derive(Default)]
+struct Http2UploadDiagnostics {
+    chunks: AtomicU64,
+    bytes: AtomicU64,
+    max_chunk_size: AtomicUsize,
+}
+
+impl Http2UploadDiagnostics {
+    fn record_chunk(&self, len: usize) {
+        self.chunks.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+        self.max_chunk_size.fetch_max(len, Ordering::Relaxed);
+    }
+}
+
+async fn idle_watchdog(started: Instant, last_activity_ms: Arc<AtomicU64>, idle_timeout: Duration) {
+    let idle_timeout_ms = elapsed_millis(idle_timeout);
+    loop {
+        let last_ms = last_activity_ms.load(Ordering::Relaxed);
+        let now_ms = elapsed_millis(started.elapsed());
+        let idle_ms = now_ms.saturating_sub(last_ms);
+        if idle_ms >= idle_timeout_ms {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(idle_timeout_ms - idle_ms)).await;
+    }
+}
+
+fn mark_activity(last_activity_ms: &AtomicU64, started: Instant) {
+    last_activity_ms.store(elapsed_millis(started.elapsed()), Ordering::Relaxed);
 }
 
 async fn send_h2_data(
@@ -463,10 +553,10 @@ async fn send_error_response(
     Ok(())
 }
 
-fn flatten_join_result(
-    result: std::result::Result<Result<u64>, tokio::task::JoinError>,
+fn flatten_join_result<T>(
+    result: std::result::Result<Result<T>, tokio::task::JoinError>,
     task_name: &str,
-) -> Result<u64> {
+) -> Result<T> {
     result
         .with_context(|| format!("{task_name} join failed"))?
         .with_context(|| format!("{task_name} failed"))
@@ -682,9 +772,14 @@ mod tests {
             let handler = tokio::spawn(async move {
                 let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
                 let send = respond.send_response(response, false).unwrap();
-                relay_http2_stream(request.into_body(), send, target_for_relay)
-                    .await
-                    .unwrap()
+                relay_http2_stream(
+                    request.into_body(),
+                    send,
+                    target_for_relay,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
             });
 
             let driver = tokio::spawn(async move {
@@ -723,8 +818,70 @@ mod tests {
         drop(send);
         drop(client);
         connection.await.unwrap();
-        assert_eq!(server.await.unwrap(), (4, 4));
+        let stats = server.await.unwrap();
+        assert_eq!(stats.upload_bytes, 4);
+        assert_eq!(stats.download_bytes, 4);
+        assert_eq!(stats.upload_chunks, 1);
+        assert_eq!(stats.upload_max_chunk_size, 4);
+        assert_eq!(stats.upload_avg_chunk_size, 4);
+        assert_eq!(stats.close_reason, RelayCloseReason::Closed);
         target.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closes_idle_http2_stream_after_timeout() {
+        let (target_for_relay, _target_peer) = tokio::io::duplex(64 * 1024);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            let handler = tokio::spawn(async move {
+                let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let send = respond.send_response(response, false).unwrap();
+                relay_http2_stream(
+                    request.into_body(),
+                    send,
+                    target_for_relay,
+                    Duration::from_millis(20),
+                )
+                .await
+                .unwrap()
+            });
+
+            let driver = tokio::spawn(async move {
+                while let Some(result) = server.accept().await {
+                    result.unwrap();
+                }
+            });
+
+            let result = handler.await.unwrap();
+            driver.abort();
+            result
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let connection = tokio::spawn(async move { connection.await.unwrap() });
+
+        client = client.ready().await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://localhost/api/tunnel/h2")
+            .body(())
+            .unwrap();
+        let (response, _send) = client.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stats = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("idle HTTP/2 relay did not close")
+            .unwrap();
+        assert_eq!(stats.upload_bytes, 0);
+        assert_eq!(stats.download_bytes, 0);
+        assert_eq!(stats.close_reason, RelayCloseReason::IdleTimeout);
+
+        drop(response);
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection).await;
     }
 
     #[tokio::test]
@@ -746,9 +903,14 @@ mod tests {
             let handler = tokio::spawn(async move {
                 let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
                 let send = respond.send_response(response, false).unwrap();
-                relay_http2_stream(request.into_body(), send, target_for_relay)
-                    .await
-                    .unwrap()
+                relay_http2_stream(
+                    request.into_body(),
+                    send,
+                    target_for_relay,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
             });
 
             let driver = tokio::spawn(async move {
@@ -791,7 +953,9 @@ mod tests {
             .await
             .expect("large HTTP/2 relay task stalled")
             .unwrap();
-        assert_eq!(relay_result, (0, payload.len() as u64));
+        assert_eq!(relay_result.upload_bytes, 0);
+        assert_eq!(relay_result.download_bytes, payload.len() as u64);
+        assert_eq!(relay_result.close_reason, RelayCloseReason::Closed);
         driver.abort();
         let _ = driver.await;
 

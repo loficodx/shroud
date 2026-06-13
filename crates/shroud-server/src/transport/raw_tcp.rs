@@ -2,6 +2,7 @@ use crate::auth::validate_auth_bytes;
 use crate::transport::tcp_target::{TargetConnectError, connect_target};
 use anyhow::{Context, Result};
 use shroud_core::config::{AuthorizedClient, RelayConfig, ServerSecurityConfig, TimeoutsConfig};
+use shroud_core::relay::copy_bidirectional_with_sizes_and_idle_timeout;
 use shroud_core::tcp_handshake::{
     ClientAuthProof, TcpConnectStatus, read_raw_tcp_connect_request, write_raw_tcp_connect_status,
 };
@@ -21,6 +22,7 @@ pub struct RawTcpServerState {
     clients: Vec<AuthorizedClient>,
     request_read_timeout: Duration,
     target_connect_timeout: Duration,
+    idle_timeout: Duration,
     security: ServerSecurityConfig,
     relay: RelayConfig,
     nonce_cache: Arc<RawTcpNonceCache>,
@@ -53,6 +55,7 @@ impl RawTcpServerState {
             clients,
             request_read_timeout: Duration::from_millis(timeouts.raw_tcp_handshake_ms),
             target_connect_timeout: Duration::from_millis(timeouts.target_connect_ms),
+            idle_timeout: Duration::from_secs(timeouts.idle_timeout_sec),
             security,
             relay,
             nonce_cache: Arc::new(RawTcpNonceCache::new(
@@ -177,11 +180,12 @@ where
 
     let target_tcp_connect_ms = connected_target.connect_ms;
     let relay_started = Instant::now();
-    let (bytes_up, bytes_down) = tokio::io::copy_bidirectional_with_sizes(
+    let relay_stats = copy_bidirectional_with_sizes_and_idle_timeout(
         &mut inbound,
         &mut target,
         state.relay.upload_buffer_size,
         state.relay.download_buffer_size,
+        state.idle_timeout,
     )
     .await
     .context("raw_tcp raw relay failed")?;
@@ -193,9 +197,9 @@ where
         auth_result = "ok",
         target_tcp_connect_ms,
         relay_duration_ms = elapsed_millis(relay_started.elapsed()),
-        relay_bytes_up = bytes_up,
-        relay_bytes_down = bytes_down,
-        close_reason = "closed",
+        relay_bytes_up = relay_stats.a_to_b_bytes,
+        relay_bytes_down = relay_stats.b_to_a_bytes,
+        close_reason = relay_stats.close_reason.as_str(),
         "raw_tcp server relay closed"
     );
 

@@ -224,7 +224,7 @@ async fn handle_tcp_stream(
                     relay_bytes_up = stats.client_to_upstream_bytes,
                     relay_bytes_down = stats.upstream_to_client_bytes,
                     relay_duration_ms = elapsed_millis(relay_elapsed),
-                    close_reason = "closed",
+                    close_reason = stats.close_reason.as_str(),
                     "TUN raw_tcp relay closed"
                 ),
                 RouteAction::Direct => debug!(
@@ -236,7 +236,7 @@ async fn handle_tcp_stream(
                     relay_bytes_up = stats.client_to_upstream_bytes,
                     relay_bytes_down = stats.upstream_to_client_bytes,
                     relay_duration_ms = elapsed_millis(relay_elapsed),
-                    close_reason = "closed",
+                    close_reason = stats.close_reason.as_str(),
                     "TUN direct TCP relay closed"
                 ),
                 RouteAction::Block => {}

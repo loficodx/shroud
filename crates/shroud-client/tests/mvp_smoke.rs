@@ -525,7 +525,13 @@ async fn start_socks_client_with_dns(
         auth_config(client_secret),
         TimeoutsConfig::default(),
     )?;
-    let session = SessionCore::new(router, tcp_transport, dns, Default::default());
+    let session = SessionCore::new(
+        router,
+        tcp_transport,
+        dns,
+        TimeoutsConfig::default(),
+        Default::default(),
+    );
 
     let handle = tokio::spawn(async move {
         let _ = socks5::serve(listen, session, 4096).await;

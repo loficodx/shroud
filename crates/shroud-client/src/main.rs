@@ -73,7 +73,13 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
             cfg.timeouts,
         )
         .context("failed to build TCP transport")?;
-        let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone(), cfg.relay);
+        let session = session::SessionCore::new(
+            router,
+            tcp_transport,
+            cfg.dns.clone(),
+            cfg.timeouts,
+            cfg.relay,
+        );
         let device = tun::device::open(&cfg.inbounds.tun)
             .with_context(|| format!("failed to set up TUN device {}", cfg.inbounds.tun.name))?;
         info!(
@@ -121,7 +127,13 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
         cfg.timeouts,
     )
     .context("failed to build TCP transport")?;
-    let session = session::SessionCore::new(router, tcp_transport, cfg.dns.clone(), cfg.relay);
+    let session = session::SessionCore::new(
+        router,
+        tcp_transport,
+        cfg.dns.clone(),
+        cfg.timeouts,
+        cfg.relay,
+    );
 
     socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }

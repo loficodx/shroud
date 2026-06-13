@@ -1,7 +1,8 @@
 use crate::routing::Router;
 use crate::transport::{BoxedIo, TcpTransport, TcpTransportMetrics};
 use anyhow::{Context, Result};
-use shroud_core::config::{ClientDnsConfig, RelayConfig, RouteAction};
+use shroud_core::config::{ClientDnsConfig, RelayConfig, RouteAction, TimeoutsConfig};
+use shroud_core::relay::{RelayCloseReason, copy_bidirectional_with_sizes_and_idle_timeout};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ pub struct SessionCore {
     tcp_transport: Arc<dyn TcpTransport>,
     dns: ClientDnsConfig,
     relay: RelayConfig,
+    idle_timeout: Duration,
 }
 
 impl SessionCore {
@@ -24,6 +26,7 @@ impl SessionCore {
         router: Router,
         tcp_transport: Arc<dyn TcpTransport>,
         dns: ClientDnsConfig,
+        timeouts: TimeoutsConfig,
         relay: RelayConfig,
     ) -> Self {
         Self {
@@ -31,6 +34,7 @@ impl SessionCore {
             tcp_transport,
             dns,
             relay,
+            idle_timeout: Duration::from_secs(timeouts.idle_timeout_sec),
         }
     }
 
@@ -154,19 +158,20 @@ impl SessionCore {
         S: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
     {
-        let (client_to_upstream_bytes, upstream_to_client_bytes) =
-            tokio::io::copy_bidirectional_with_sizes(
-                client_stream,
-                upstream,
-                self.relay.upload_buffer_size,
-                self.relay.download_buffer_size,
-            )
-            .await
-            .context("raw TCP relay failed")?;
+        let stats = copy_bidirectional_with_sizes_and_idle_timeout(
+            client_stream,
+            upstream,
+            self.relay.upload_buffer_size,
+            self.relay.download_buffer_size,
+            self.idle_timeout,
+        )
+        .await
+        .context("raw TCP relay failed")?;
 
         Ok(RelayStats {
-            client_to_upstream_bytes,
-            upstream_to_client_bytes,
+            client_to_upstream_bytes: stats.a_to_b_bytes,
+            upstream_to_client_bytes: stats.b_to_a_bytes,
+            close_reason: stats.close_reason,
         })
     }
 }
@@ -206,6 +211,7 @@ pub struct TcpOpenMetrics {
 pub struct RelayStats {
     pub client_to_upstream_bytes: u64,
     pub upstream_to_client_bytes: u64,
+    pub close_reason: RelayCloseReason,
 }
 
 impl From<TcpTransportMetrics> for TcpOpenMetrics {

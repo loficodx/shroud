@@ -87,6 +87,12 @@ pub struct H2StreamIo {
     read_buf: Bytes,
     write_capacity_requested: bool,
     send_closed: bool,
+    bytes_up: u64,
+    bytes_down: u64,
+    send_data_calls: u64,
+    capacity_pending_count: u64,
+    capacity_zero_count: u64,
+    max_write_chunk_size: usize,
 }
 
 impl Http2Transport {
@@ -426,6 +432,12 @@ impl H2StreamIo {
             read_buf: Bytes::new(),
             write_capacity_requested: false,
             send_closed: false,
+            bytes_up: 0,
+            bytes_down: 0,
+            send_data_calls: 0,
+            capacity_pending_count: 0,
+            capacity_zero_count: 0,
+            max_write_chunk_size: 0,
         }
     }
 }
@@ -445,6 +457,7 @@ impl AsyncRead for H2StreamIo {
 
                 buf.put_slice(&self.read_buf[..len]);
                 self.read_buf.advance(len);
+                self.bytes_down = self.bytes_down.saturating_add(len as u64);
                 if let Err(err) = self.recv.flow_control().release_capacity(len) {
                     return Poll::Ready(Err(io::Error::other(err)));
                 }
@@ -483,6 +496,7 @@ impl AsyncWrite for H2StreamIo {
 
         let mut capacity = self.send.capacity();
         while capacity == 0 {
+            self.capacity_zero_count = self.capacity_zero_count.saturating_add(1);
             if !self.write_capacity_requested {
                 self.send.reserve_capacity(buf.len().min(MAX_H2_DATA_CHUNK));
                 self.write_capacity_requested = true;
@@ -497,7 +511,10 @@ impl AsyncWrite for H2StreamIo {
                         "HTTP/2 send stream capacity is closed",
                     )));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.capacity_pending_count = self.capacity_pending_count.saturating_add(1);
+                    return Poll::Pending;
+                }
             };
         }
         self.write_capacity_requested = false;
@@ -506,6 +523,9 @@ impl AsyncWrite for H2StreamIo {
         self.send
             .send_data(Bytes::copy_from_slice(&buf[..len]), false)
             .map_err(io::Error::other)?;
+        self.bytes_up = self.bytes_up.saturating_add(len as u64);
+        self.send_data_calls = self.send_data_calls.saturating_add(1);
+        self.max_write_chunk_size = self.max_write_chunk_size.max(len);
         Poll::Ready(Ok(len))
     }
 
@@ -521,6 +541,21 @@ impl AsyncWrite for H2StreamIo {
             self.send_closed = true;
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for H2StreamIo {
+    fn drop(&mut self) {
+        debug!(
+            bytes_up = self.bytes_up,
+            bytes_down = self.bytes_down,
+            send_data_calls = self.send_data_calls,
+            capacity_pending_count = self.capacity_pending_count,
+            capacity_zero_count = self.capacity_zero_count,
+            max_write_chunk_size = self.max_write_chunk_size,
+            send_closed = self.send_closed,
+            "HTTP/2 client stream closed"
+        );
     }
 }
 
@@ -719,10 +754,14 @@ mod tests {
 
         stream.write_all(b"ping").await.unwrap();
         stream.shutdown().await.unwrap();
+        assert_eq!(stream.bytes_up, 4);
+        assert_eq!(stream.send_data_calls, 1);
+        assert_eq!(stream.max_write_chunk_size, 4);
 
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
+        assert_eq!(stream.bytes_down, 4);
 
         server.await.unwrap();
     }
