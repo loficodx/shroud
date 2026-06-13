@@ -145,7 +145,7 @@ async fn handle_http2_request(
         }
     };
     let target = format_target(&metadata.target_host, metadata.target_port);
-    info!(
+    debug!(
         %peer,
         target = %target,
         "accepted HTTP/2 stream"
@@ -201,7 +201,7 @@ async fn handle_http2_request(
         Ok(connected_target) => connected_target,
     };
     let target_tcp_connect_ms = connected_target.connect_ms;
-    info!(
+    debug!(
         %peer,
         target = %target,
         connect_ms = target_tcp_connect_ms,
@@ -227,7 +227,7 @@ async fn handle_http2_request(
     let (upload_bytes, download_bytes) =
         relay_http2_stream(request.into_body(), send, target).await?;
 
-    info!(
+    debug!(
         %peer,
         client_id = %metadata.client_id,
         target = %format_target(&metadata.target_host, metadata.target_port),

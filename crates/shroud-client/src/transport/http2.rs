@@ -123,7 +123,7 @@ impl Http2Transport {
 
     async fn open_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpTransportConnect> {
         let pool_index = self.pool.next_index();
-        info!(
+        debug!(
             target = %format_target(target_host, target_port),
             pool_index,
             "opening HTTP/2 stream"
@@ -137,7 +137,7 @@ impl Http2Transport {
                 .await
             {
                 Ok(opened) => {
-                    info!(
+                    debug!(
                         target = %format_target(target_host, target_port),
                         pool_index,
                         "HTTP/2 stream established"
