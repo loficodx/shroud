@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use glob::glob;
 use shroud_core::config::load_client_config_yaml;
+use shroud_core::fs_util::create_parent_dir;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,17 +108,6 @@ impl ConfigStore {
     pub fn validate(&self, raw: &str) -> Result<()> {
         load_client_config_yaml(raw).map(|_| ()).map_err(Into::into)
     }
-}
-
-fn create_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    Ok(())
 }
 
 fn atomic_save_tmp_path(path: &Path) -> PathBuf {

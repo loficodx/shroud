@@ -57,6 +57,38 @@ pub fn render_client_yaml_from_import(conn: ImportConnection) -> Result<String> 
     serde_yaml::to_string(&yaml).context("failed to render client config yaml")
 }
 
+pub fn default_client_import_file_name(name: Option<&str>) -> String {
+    format!(
+        "client-{}.yaml",
+        sanitize_profile_name(name.unwrap_or("import"))
+    )
+}
+
+pub fn sanitize_profile_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if (ch == '-' || ch == '_') && !out.is_empty() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "import".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ImportClientYaml {
     inbounds: ClientInboundsConfig,
@@ -204,5 +236,24 @@ mod tests {
         assert!(yaml.contains("transport:\n"));
         assert!(yaml.contains("server: 138.124.55.220\n"));
         load_client_config_yaml(&yaml).expect("generated yaml is valid");
+    }
+
+    #[test]
+    fn sanitize_profile_name_normalizes_profile_names_for_file_paths() {
+        assert_eq!(sanitize_profile_name("Work Laptop"), "work-laptop");
+        assert_eq!(sanitize_profile_name("!!!"), "import");
+        assert_eq!(sanitize_profile_name("my_server-01"), "my_server-01");
+    }
+
+    #[test]
+    fn default_client_import_file_name_uses_sanitized_profile_name() {
+        assert_eq!(
+            default_client_import_file_name(Some("Work Laptop")),
+            "client-work-laptop.yaml"
+        );
+        assert_eq!(
+            default_client_import_file_name(Some("!!!")),
+            "client-import.yaml"
+        );
     }
 }

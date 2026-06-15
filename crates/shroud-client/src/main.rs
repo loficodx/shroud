@@ -1,27 +1,30 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use args::{ClientCommand, ImportOptions, LogFormat};
 use shroud_core::config::LoggingConfig;
-use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
+use shroud_core::fs_util::create_parent_dir;
+use shroud_core::import::{
+    decode_import_connection, default_client_import_file_name, render_client_yaml_from_import,
+};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod args;
 mod cfg;
 mod inbound;
 mod runtime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let command = Cli::parse().into_command()?;
+    let command = args::parse()?;
     match command {
         ClientCommand::Run {
             config_path,
             log_format,
         } => run_client(config_path, log_format).await,
         ClientCommand::Import(options) => {
-            init_tracing(LogFormat::Plain, &LoggingConfig::default());
             run_import_command(options)?;
             Ok(())
         }
@@ -31,6 +34,7 @@ async fn main() -> Result<()> {
 async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
     let cfg = cfg::load_client_config(&config_path)?;
     init_tracing(log_format, &cfg.logging);
+
     info!(
         mode = ?cfg.transport.mode,
         server = %cfg.transport.server,
@@ -57,85 +61,6 @@ fn init_tracing(log_format: LogFormat, logging: &LoggingConfig) {
     }
 }
 
-#[derive(Debug, Parser)]
-#[command(name = "shroud-client")]
-struct Cli {
-    #[arg(value_name = "config-path")]
-    config_path: Option<PathBuf>,
-
-    #[arg(
-        short = 'c',
-        long = "config",
-        value_name = "path",
-        conflicts_with = "config_path"
-    )]
-    config: Option<PathBuf>,
-
-    #[arg(long = "log-format", value_enum, default_value = "plain")]
-    log_format: LogFormat,
-
-    #[command(subcommand)]
-    command: Option<ClientSubcommand>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ClientCommand {
-    Run {
-        config_path: PathBuf,
-        log_format: LogFormat,
-    },
-    Import(ImportOptions),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum LogFormat {
-    Plain,
-    Json,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ImportOptions {
-    raw: String,
-    output: Option<PathBuf>,
-    force: bool,
-}
-
-#[derive(Debug, Subcommand)]
-enum ClientSubcommand {
-    Import(ImportArgs),
-}
-
-#[derive(Debug, clap::Args)]
-struct ImportArgs {
-    #[arg(value_name = "shrd:1:...")]
-    raw: String,
-
-    #[arg(short = 'o', long = "output", value_name = "path")]
-    output: Option<PathBuf>,
-
-    #[arg(long = "force")]
-    force: bool,
-}
-
-impl Cli {
-    fn into_command(self) -> Result<ClientCommand> {
-        match self.command {
-            Some(ClientSubcommand::Import(args)) => Ok(ClientCommand::Import(ImportOptions {
-                raw: args.raw,
-                output: args.output,
-                force: args.force,
-            })),
-            None => Ok(ClientCommand::Run {
-                config_path: self
-                    .config
-                    .or(self.config_path)
-                    .unwrap_or_else(|| PathBuf::from("configs/client.yaml")),
-                log_format: self.log_format,
-            }),
-        }
-    }
-}
-
 fn run_import_command(options: ImportOptions) -> Result<()> {
     let conn = decode_import_connection(&options.raw)?;
     let default_file_name_source = conn
@@ -144,7 +69,9 @@ fn run_import_command(options: ImportOptions) -> Result<()> {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&conn.server);
     let output_path = options.output.unwrap_or_else(|| {
-        PathBuf::from(default_import_output_path(Some(default_file_name_source)))
+        PathBuf::from(default_client_import_file_name(Some(
+            default_file_name_source,
+        )))
     });
     let yaml = render_client_yaml_from_import(conn)?;
     create_parent_dir(&output_path)?;
@@ -171,168 +98,14 @@ fn run_import_command(options: ImportOptions) -> Result<()> {
     Ok(())
 }
 
-fn create_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    Ok(())
-}
-
-fn default_import_output_path(name: Option<&str>) -> String {
-    format!(
-        "client-{}.yaml",
-        sanitize_profile_name(name.unwrap_or("import"))
-    )
-}
-
-fn sanitize_profile_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if (ch == '-' || ch == '_') && !out.is_empty() {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash && !out.is_empty() {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "import".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cli, ClientCommand, ImportOptions, LogFormat, default_import_output_path,
-        run_import_command,
-    };
-    use clap::Parser;
+    use super::{ImportOptions, run_import_command};
     use shroud_core::config::{TransportMode, load_client_config_yaml};
     use shroud_core::import::{ImportConnection, encode_import_connection};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn parse_cli_defaults_to_sample_client_config() {
-        let config_path = Cli::try_parse_from(["shroud-client"])
-            .expect("parse default config")
-            .into_command()
-            .expect("build command");
-
-        assert_eq!(
-            config_path,
-            ClientCommand::Run {
-                config_path: PathBuf::from("configs/client.yaml"),
-                log_format: LogFormat::Plain,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cli_accepts_config_path() {
-        let config_path = Cli::try_parse_from(["shroud-client", "custom-client.yaml"])
-            .expect("parse custom config")
-            .into_command()
-            .expect("build command");
-
-        assert_eq!(
-            config_path,
-            ClientCommand::Run {
-                config_path: PathBuf::from("custom-client.yaml"),
-                log_format: LogFormat::Plain,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cli_accepts_explicit_config_path() {
-        let command =
-            Cli::try_parse_from(["shroud-client", "--config", "configs/client-laptop.yaml"])
-                .expect("parse --config")
-                .into_command()
-                .expect("build command");
-
-        assert_eq!(
-            command,
-            ClientCommand::Run {
-                config_path: PathBuf::from("configs/client-laptop.yaml"),
-                log_format: LogFormat::Plain,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cli_accepts_log_format() {
-        let command = Cli::try_parse_from([
-            "shroud-client",
-            "--config",
-            "configs/client-laptop.yaml",
-            "--log-format",
-            "json",
-        ])
-        .expect("parse --log-format")
-        .into_command()
-        .expect("build command");
-
-        assert_eq!(
-            command,
-            ClientCommand::Run {
-                config_path: PathBuf::from("configs/client-laptop.yaml"),
-                log_format: LogFormat::Json,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cli_accepts_import_command() {
-        let command = Cli::try_parse_from([
-            "shroud-client",
-            "import",
-            "shrd:1:test",
-            "--output",
-            "configs/client-laptop.yaml",
-            "--force",
-        ])
-        .expect("parse import command")
-        .into_command()
-        .expect("build command");
-
-        assert_eq!(
-            command,
-            ClientCommand::Import(ImportOptions {
-                raw: "shrd:1:test".to_string(),
-                output: Some(PathBuf::from("configs/client-laptop.yaml")),
-                force: true,
-            })
-        );
-    }
-
-    #[test]
-    fn import_output_path_uses_profile_name() {
-        assert_eq!(
-            default_import_output_path(Some("Work Laptop")),
-            "client-work-laptop.yaml"
-        );
-        assert_eq!(
-            default_import_output_path(Some("!!!")),
-            "client-import.yaml"
-        );
-    }
 
     #[test]
     fn import_command_writes_valid_client_config_without_overwriting_by_default() {

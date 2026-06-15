@@ -5,6 +5,7 @@ use shroud_core::config::{
     AuthorizedClient, ServerConfig, ServerSecurityConfig, ServerTlsConfig, TimeoutsConfig,
     generate_client_credentials,
 };
+use shroud_core::fs_util::create_parent_dir;
 use shroud_core::import::{ImportConnection, encode_import_connection};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -497,17 +498,6 @@ fn write_cert_pair(
         .with_context(|| format!("failed to write server private key {}", key_path.display()))?;
     chmod_public_cert(cert_path)?;
     chmod_private_key(key_path)?;
-    Ok(())
-}
-
-fn create_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
     Ok(())
 }
 

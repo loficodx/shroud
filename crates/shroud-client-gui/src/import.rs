@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
+use shroud_core::import::{
+    decode_import_connection, default_client_import_file_name, render_client_yaml_from_import,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,45 +17,13 @@ pub fn render_imported_client_yaml(raw: &str) -> Result<ImportedClientConfig> {
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&conn.server);
-    let default_file_name = default_import_file_name(Some(file_name_source));
+    let default_file_name = default_client_import_file_name(Some(file_name_source));
     let yaml = render_client_yaml_from_import(conn).context("failed to render client config")?;
 
     Ok(ImportedClientConfig {
         yaml,
         default_file_name,
     })
-}
-
-pub fn default_import_file_name(name: Option<&str>) -> String {
-    format!(
-        "client-{}.yaml",
-        sanitize_profile_name(name.unwrap_or("import"))
-    )
-}
-
-fn sanitize_profile_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if (ch == '-' || ch == '_') && !out.is_empty() {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash && !out.is_empty() {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "import".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 pub fn unique_import_file_path(base_path: &Path) -> PathBuf {
@@ -89,20 +59,11 @@ pub fn unique_import_file_path(base_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_import_file_name, render_imported_client_yaml, unique_import_file_path};
+    use super::{render_imported_client_yaml, unique_import_file_path};
     use shroud_core::config::TransportMode;
     use shroud_core::import::{ImportConnection, encode_import_connection};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn default_import_file_name_uses_sanitized_profile_name() {
-        assert_eq!(
-            default_import_file_name(Some("Work Laptop")),
-            "client-work-laptop.yaml"
-        );
-        assert_eq!(default_import_file_name(Some("!!!")), "client-import.yaml");
-    }
 
     #[test]
     fn render_imported_client_yaml_uses_server_for_default_file_name_when_name_is_missing() {
