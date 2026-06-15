@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use shroud_client::{routing, session, socks5, transport, tun};
-use shroud_core::config::{LoggingConfig, TransportEndpointConfig, load_client_config_yaml};
+use shroud_core::config::LoggingConfig;
 use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+mod cfg;
+mod inbound;
+mod runtime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,10 +29,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
-    let raw = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read client config: {}", config_path.display()))?;
-    let cfg = load_client_config_yaml(&raw)
-        .with_context(|| format!("failed to load client config: {}", config_path.display()))?;
+    let cfg = cfg::load_client_config(&config_path)?;
     init_tracing(log_format, &cfg.logging);
     info!(
         mode = ?cfg.transport.mode,
@@ -39,84 +39,11 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
         "selected TCP transport mode"
     );
 
-    let mut endpoint = TransportEndpointConfig::from(&cfg.transport);
-    if cfg.inbounds.tun.enabled && cfg.inbounds.tun.auto_route {
-        endpoint = tun::route::prepare_auto_route_outbound(endpoint)?;
-    }
-
-    let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
-
     if cfg.inbounds.tun.enabled {
-        let tcp_transport = transport::build_tcp_transport(
-            cfg.transport.mode,
-            endpoint.clone(),
-            cfg.auth.clone(),
-            cfg.timeouts,
-        )
-        .context("failed to build TCP transport")?;
-        let session = session::SessionCore::new(
-            router,
-            tcp_transport,
-            cfg.dns.clone(),
-            cfg.timeouts,
-            cfg.relay,
-        );
-        let device = tun::device::open(&cfg.inbounds.tun)
-            .with_context(|| format!("failed to set up TUN device {}", cfg.inbounds.tun.name))?;
-        info!(
-            tun = device.name(),
-            address = %cfg.inbounds.tun.address,
-            mtu = cfg.inbounds.tun.mtu,
-            auto_route = cfg.inbounds.tun.auto_route,
-            "TUN device opened; starting smoltcp-backed packet engine"
-        );
-        let _route_guard =
-            tun::route::setup_before_packet_engine(device.name(), &cfg.inbounds.tun, &endpoint)?;
-        let fake_dns = tun::dns::FakeDns::new();
-        let fake_dns_addr = tun::dns::listen_addr(&cfg.inbounds.tun);
-        info!(
-            listen = %fake_dns_addr,
-            "starting TUN fake DNS listener"
-        );
-        tokio::spawn(tun::dns::serve(fake_dns_addr, fake_dns.clone()));
-
-        info!(tun = device.name(), "starting TUN packet engine");
-        return tun::engine::TunEngine::new(
-            device,
-            session,
-            fake_dns,
-            cfg.inbounds.tun.mtu,
-            cfg.limits.max_concurrent_connections,
-        )
-        .run()
-        .await;
+        inbound::tun::run(cfg).await
+    } else {
+        inbound::socks::run(cfg).await
     }
-
-    let socks = cfg
-        .inbounds
-        .socks
-        .as_ref()
-        .filter(|socks| socks.enabled)
-        .context("no enabled SOCKS inbound configured")?;
-
-    info!(listen = %socks.listen, "starting shroud client");
-
-    let tcp_transport = transport::build_tcp_transport(
-        cfg.transport.mode,
-        endpoint.clone(),
-        cfg.auth.clone(),
-        cfg.timeouts,
-    )
-    .context("failed to build TCP transport")?;
-    let session = session::SessionCore::new(
-        router,
-        tcp_transport,
-        cfg.dns.clone(),
-        cfg.timeouts,
-        cfg.relay,
-    );
-
-    socks5::serve(socks.listen, session, cfg.limits.max_concurrent_connections).await
 }
 
 fn init_tracing(log_format: LogFormat, logging: &LoggingConfig) {
