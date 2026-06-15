@@ -5,9 +5,9 @@ use shroud_client::transport;
 use shroud_client::transport::TcpTransport;
 use shroud_client::transport::raw_tcp::RawTcpTransport;
 use shroud_core::config::{
-    AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
-    RoutingConfig, RoutingRule, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
-    ServerTransportConfig, TimeoutsConfig, TransportMode,
+    AuthorizedClient, ClientAuthConfig, ClientDnsConfig, RouteAction, RoutingConfig, RoutingRule,
+    ServerConfig, ServerSecurityConfig, ServerTlsConfig, ServerTransportConfig, TimeoutsConfig,
+    TransportEndpointConfig, TransportMode,
 };
 use shroud_server::web;
 use std::net::SocketAddr;
@@ -53,7 +53,7 @@ async fn socks_tls_tunnel_relays_to_target() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -82,7 +82,7 @@ async fn curl_socks5_hostname_smoke_relays_to_target() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -160,7 +160,7 @@ async fn socks_tls_tunnel_relays_large_payload() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -187,7 +187,7 @@ async fn socks_tls_tunnel_preserves_half_close_response() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -209,7 +209,7 @@ async fn socks_udp_associate_is_rejected() -> TestResult {
             default: RouteAction::Direct,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -229,7 +229,7 @@ async fn target_connect_failure_becomes_socks_general_failure() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -244,7 +244,7 @@ async fn tunnel_rejects_bad_auth() -> TestResult {
     let server = start_tunnel_server().await?;
 
     let transport = RawTcpTransport::with_timeouts(
-        outbound_config(server.addr, "/api/tunnel"),
+        outbound_config(server.addr, "/api/tunnel/h2"),
         auth_config("wrong-secret"),
         TimeoutsConfig::default(),
     )?;
@@ -266,7 +266,7 @@ async fn raw_tcp_pinned_tls_tunnel_relays_to_target() -> TestResult {
     let server = start_tunnel_server().await?;
 
     let transport = RawTcpTransport::with_timeouts(
-        pinned_outbound_config(server.addr, "/api/tunnel", SERVER_CERT_SHA256),
+        pinned_outbound_config(server.addr, "/api/tunnel/h2", SERVER_CERT_SHA256),
         auth_config(CLIENT_SECRET),
         TimeoutsConfig::default(),
     )?;
@@ -286,7 +286,7 @@ async fn raw_tcp_pinned_tls_rejects_cert_pin_mismatch() -> TestResult {
     let wrong_pin = "1111111111111111111111111111111111111111111111111111111111111111";
 
     let transport = RawTcpTransport::with_timeouts(
-        pinned_outbound_config(server.addr, "/api/tunnel", wrong_pin),
+        pinned_outbound_config(server.addr, "/api/tunnel/h2", wrong_pin),
         auth_config(CLIENT_SECRET),
         TimeoutsConfig::default(),
     )?;
@@ -310,7 +310,7 @@ async fn socks_handshake_stall_does_not_complete() -> TestResult {
             default: RouteAction::Direct,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -330,7 +330,7 @@ async fn socks_connect_request_stall_does_not_complete() -> TestResult {
             default: RouteAction::Direct,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -359,7 +359,7 @@ async fn direct_route_bypasses_tunnel_and_relays_to_target() -> TestResult {
             default: RouteAction::Direct,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -392,7 +392,7 @@ async fn block_route_rejects_socks_connect() -> TestResult {
                 port: Some(80),
             }],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
     )
     .await?;
@@ -410,7 +410,7 @@ async fn dns_policy_can_block_ip_targets() -> TestResult {
             default: RouteAction::Direct,
             rules: vec![],
         },
-        "/api/tunnel",
+        "/api/tunnel/h2",
         CLIENT_SECRET,
         ClientDnsConfig {
             remote_by_default: true,
@@ -430,23 +430,14 @@ async fn dns_policy_can_block_ip_targets() -> TestResult {
 }
 
 async fn start_tunnel_server() -> TestResult<RunningTask> {
-    start_tunnel_server_with_modes_and_path(vec![TransportMode::RawTcp], "/api/tunnel").await
+    start_tunnel_server_with_modes(vec![TransportMode::RawTcp]).await
 }
 
 async fn start_tunnel_server_with_modes(modes: Vec<TransportMode>) -> TestResult<RunningTask> {
-    start_tunnel_server_with_modes_and_path(modes, "/api/tunnel/h2").await
-}
-
-async fn start_tunnel_server_with_modes_and_path(
-    modes: Vec<TransportMode>,
-    tunnel_path: &str,
-) -> TestResult<RunningTask> {
     let addr = free_addr().await?;
     let cfg = ServerConfig {
         listen: addr,
-        tunnel_path: tunnel_path.to_string(),
         web_root: "./web".to_string(),
-        logging: Default::default(),
         transport: ServerTransportConfig { modes },
         tls: ServerTlsConfig {
             enabled: true,
@@ -478,13 +469,13 @@ async fn start_tunnel_server_with_modes_and_path(
 async fn start_socks_client(
     tunnel_addr: SocketAddr,
     routing: RoutingConfig,
-    tunnel_path: &str,
+    transport_path: &str,
     client_secret: &str,
 ) -> TestResult<RunningTask> {
     start_socks_client_with_mode(
         tunnel_addr,
         routing,
-        tunnel_path,
+        transport_path,
         client_secret,
         TransportMode::RawTcp,
     )
@@ -494,14 +485,14 @@ async fn start_socks_client(
 async fn start_socks_client_with_mode(
     tunnel_addr: SocketAddr,
     routing: RoutingConfig,
-    tunnel_path: &str,
+    transport_path: &str,
     client_secret: &str,
     mode: TransportMode,
 ) -> TestResult<RunningTask> {
     start_socks_client_with_dns(
         tunnel_addr,
         routing,
-        tunnel_path,
+        transport_path,
         client_secret,
         ClientDnsConfig::default(),
         mode,
@@ -512,7 +503,7 @@ async fn start_socks_client_with_mode(
 async fn start_socks_client_with_dns(
     tunnel_addr: SocketAddr,
     routing: RoutingConfig,
-    tunnel_path: &str,
+    transport_path: &str,
     client_secret: &str,
     dns: ClientDnsConfig,
     mode: TransportMode,
@@ -521,7 +512,7 @@ async fn start_socks_client_with_dns(
     let router = Router::new(routing);
     let tcp_transport = transport::build_tcp_transport(
         mode,
-        outbound_config(tunnel_addr, tunnel_path),
+        outbound_config(tunnel_addr, transport_path),
         auth_config(client_secret),
         TimeoutsConfig::default(),
     )?;
@@ -612,11 +603,11 @@ async fn start_respond_after_eof_target(response: &'static [u8]) -> TestResult<R
     Ok(RunningTask { addr, handle })
 }
 
-fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
-    OutboundConfig {
+fn outbound_config(server_addr: SocketAddr, path: &str) -> TransportEndpointConfig {
+    TransportEndpointConfig {
         server: "127.0.0.1".to_string(),
         port: server_addr.port(),
-        path: path.to_string(),
+        path: Some(path.to_string()),
         tls: true,
         tls_server_name: Some("localhost".to_string()),
         tls_ca_cert_path: Some(CA_CERT.to_string()),
@@ -624,7 +615,11 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
     }
 }
 
-fn pinned_outbound_config(server_addr: SocketAddr, path: &str, pin: &str) -> OutboundConfig {
+fn pinned_outbound_config(
+    server_addr: SocketAddr,
+    path: &str,
+    pin: &str,
+) -> TransportEndpointConfig {
     let mut outbound = outbound_config(server_addr, path);
     outbound.tls_ca_cert_path = None;
     outbound.tls_server_cert_sha256 = Some(pin.to_string());

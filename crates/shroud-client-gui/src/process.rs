@@ -6,19 +6,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ClientProcessState {
+    #[default]
     Stopped,
     Starting,
     Running,
-    Exited { code: Option<i32> },
-    Failed { error: String },
-}
-
-impl Default for ClientProcessState {
-    fn default() -> Self {
-        Self::Stopped
-    }
+    Exited {
+        code: Option<i32>,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 impl ClientProcessState {
@@ -101,12 +100,11 @@ impl ClientProcess {
         self.state = ClientProcessState::Starting;
         self.config_path = None;
         let command = build_client_command(config_path);
-        let mut child = spawn_client_command(&command).map_err(|err| {
+        let mut child = spawn_client_command(&command).inspect_err(|err| {
             self.state = ClientProcessState::Failed {
                 error: err.to_string(),
             };
             self.config_path = None;
-            err
         })?;
 
         let _ = log_sender.send(format!(

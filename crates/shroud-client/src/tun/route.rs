@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use shroud_core::config::{OutboundConfig, TunInboundConfig};
+use shroud_core::config::{TransportEndpointConfig, TunInboundConfig};
 use std::fmt;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::process::Command;
@@ -171,7 +171,7 @@ struct ResolvedEndpoint {
     was_hostname: bool,
 }
 
-fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<ResolvedEndpoint> {
+fn resolve_endpoint_ip(outbound: &TransportEndpointConfig) -> Result<ResolvedEndpoint> {
     let original_host = outbound.server.clone();
 
     if let Ok(ip) = outbound.server.parse::<IpAddr>() {
@@ -206,7 +206,9 @@ fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<ResolvedEndpoint> {
     })
 }
 
-pub fn prepare_auto_route_outbound(mut outbound: OutboundConfig) -> Result<OutboundConfig> {
+pub fn prepare_auto_route_outbound(
+    mut outbound: TransportEndpointConfig,
+) -> Result<TransportEndpointConfig> {
     let endpoint = resolve_endpoint_ip(&outbound)?;
 
     outbound.server = endpoint.ip.to_string();
@@ -231,7 +233,7 @@ fn resolve_endpoint_route(endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
 pub fn setup_before_packet_engine(
     tun_name: &str,
     tun: &TunInboundConfig,
-    outbound: &OutboundConfig,
+    outbound: &TransportEndpointConfig,
 ) -> Result<TunRouteGuard> {
     let previous_default_routes = if tun.auto_route {
         platform::default_routes().context("failed to capture existing default routes")?

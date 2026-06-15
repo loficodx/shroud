@@ -7,10 +7,6 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-// cargo run -p shroud-server -- configs/server.yaml
-// curl -i --cacert /home/laptop/Projects/shroud/certs/ca.crt https://localhost:8443/
-// curl -X POST -i --cacert /home/laptop/Projects/shroud/certs/ca.crt https://localhost:8443/api/tunnel
-
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().into_command() {
@@ -41,7 +37,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to read server config: {}", config_path.display()))?;
     let cfg = load_server_config_yaml(&raw)
         .with_context(|| format!("failed to load server config: {}", config_path.display()))?;
-    init_tracing(&cfg.logging);
+    init_tracing(&LoggingConfig::default());
 
     info!(
         listen = %cfg.listen,

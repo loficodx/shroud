@@ -9,7 +9,7 @@ use http::{HeaderMap, Method, Request, Response, StatusCode};
 use shroud_core::config::ServerConfig;
 use shroud_core::http2_protocol::{
     DEFAULT_TUNNEL_PATH, HEADER_AUTH, HEADER_CLIENT_ID, HEADER_NONCE, HEADER_TARGET_HOST,
-    HEADER_TARGET_PORT, HEADER_TIMESTAMP, LEGACY_TUNNEL_PATH,
+    HEADER_TARGET_PORT, HEADER_TIMESTAMP,
 };
 use shroud_core::relay::RelayCloseReason;
 use std::collections::HashMap;
@@ -259,7 +259,7 @@ async fn validate_http2_request(
     request: &Request<RecvStream>,
     state: &Http2ServerState,
 ) -> std::result::Result<Http2RequestMetadata, Http2RequestRejection> {
-    if request.method() != Method::POST || request.uri().path() != http2_tunnel_path(&state.cfg) {
+    if request.method() != Method::POST || request.uri().path() != DEFAULT_TUNNEL_PATH {
         return Err(Http2RequestRejection::new(
             StatusCode::NOT_FOUND,
             "invalid HTTP/2 tunnel method or path",
@@ -487,11 +487,7 @@ impl Http2RelayStats {
             close_reason,
             upload_chunks,
             upload_max_chunk_size: upload.max_chunk_size.load(Ordering::Relaxed),
-            upload_avg_chunk_size: if upload_chunks == 0 {
-                0
-            } else {
-                upload_bytes / upload_chunks
-            },
+            upload_avg_chunk_size: upload_bytes.checked_div(upload_chunks).unwrap_or(0),
         }
     }
 }
@@ -592,14 +588,6 @@ fn required_header<'a>(
     value
         .to_str()
         .map_err(|err| Http2RequestRejection::new(status, format!("invalid header {name}: {err}")))
-}
-
-fn http2_tunnel_path(cfg: &ServerConfig) -> &str {
-    if cfg.tunnel_path.trim().is_empty() || cfg.tunnel_path == LEGACY_TUNNEL_PATH {
-        DEFAULT_TUNNEL_PATH
-    } else {
-        &cfg.tunnel_path
-    }
 }
 
 fn decode_nonce(nonce_raw: &str) -> Result<Vec<u8>> {
@@ -717,9 +705,7 @@ mod tests {
     fn cfg() -> Arc<ServerConfig> {
         Arc::new(ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            tunnel_path: "/api/tunnel".to_string(),
             web_root: ".".to_string(),
-            logging: Default::default(),
             transport: ServerTransportConfig {
                 modes: vec![TransportMode::Http2],
             },
@@ -740,11 +726,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn default_server_tunnel_path_matches_client_http2_default() {
-        assert_eq!(http2_tunnel_path(&cfg()), DEFAULT_TUNNEL_PATH);
-    }
-
     #[tokio::test]
     async fn rejects_wrong_http2_method() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -754,7 +735,7 @@ mod tests {
             cfg(),
         ));
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
-        let connection = tokio::spawn(async move { connection.await });
+        let connection = tokio::spawn(connection);
 
         client = client.ready().await.unwrap();
         let request = Request::builder()
@@ -980,7 +961,7 @@ mod tests {
 
         drop(body);
         drop(client);
-        let _ = timeout(Duration::from_secs(5), connection)
+        timeout(Duration::from_secs(5), connection)
             .await
             .expect("HTTP/2 client connection task stalled")
             .unwrap();

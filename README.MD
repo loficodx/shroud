@@ -13,7 +13,7 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
 - Rust workspace with four crates:
   - `shroud-core` - shared config, auth, legacy frame helpers, and `raw_tcp` handshake types;
   - `shroud-client` - local SOCKS5/TUN client, routing, DNS policy checks, and outbound transport;
-  - `shroud-server` - TLS listener, `raw_tcp` authentication, target ACL checks, TCP relay, and legacy HTTP/static handler code;
+  - `shroud-server` - TLS listener, `raw_tcp` authentication, target ACL checks, TCP relay, HTTP/2 transport, and static handler code;
   - `shroud-client-gui` - native egui client launcher/config editor for discovered client YAML files.
 - Client inbounds:
   - SOCKS5 no-auth handshake;
@@ -158,7 +158,7 @@ Workspace layout:
 
 ## Configuration
 
-The current client config shape uses `transport`, not the old `outbound` block. Legacy `outbound` is still accepted for compatibility, but the client logs a deprecation warning. If both `transport` and legacy `outbound` are present, `transport` wins.
+The client config shape uses `inbounds` and `transport`. Legacy `inbound`, `outbound`, and `outbounds` blocks are rejected.
 
 Example client config:
 
@@ -185,7 +185,6 @@ transport:
   port: 8443
   tls: true
   tls_server_name: "localhost"
-  # Replace with the value printed by `shroud-server generate-certs`.
   tls_server_cert_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 timeouts:
@@ -228,10 +227,7 @@ Example server config:
 
 ```yaml
 listen: "0.0.0.0:8443"
-tunnel_path: "/api/tunnel"
 web_root: "./web"
-logging:
-  level: "info"
 transport:
   modes:
     - raw_tcp
@@ -262,7 +258,7 @@ clients:
 
 `security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
 
-`logging.level` controls runtime log verbosity for both `shroud-client` and `shroud-server`. Supported values are `trace`, `debug`, `info`, `warn`, `error`, and `off`; `RUST_LOG` is not used for the client/server log level.
+Client `logging.level` controls runtime log verbosity for `shroud-client`. Supported values are `trace`, `debug`, `info`, `warn`, `error`, and `off`; `RUST_LOG` is not used for the client log level.
 
 ## Server Setup
 

@@ -27,28 +27,28 @@ impl Router {
 }
 
 fn apply_rule(rule: &RoutingRule, target_host: &str, target_port: u16) -> Option<RouteAction> {
-    if let Some(port) = rule.port {
-        if port != target_port {
-            return None;
-        }
+    if let Some(port) = rule.port
+        && port != target_port
+    {
+        return None;
     }
 
-    if let Some(domain) = &rule.domain {
-        if !domain_matches(domain, target_host) {
-            return None;
-        }
+    if let Some(domain) = &rule.domain
+        && !domain_matches(domain, target_host)
+    {
+        return None;
     }
 
-    if let Some(suffix) = &rule.domain_suffix {
-        if !domain_suffix_matches(suffix, target_host) {
-            return None;
-        }
+    if let Some(suffix) = &rule.domain_suffix
+        && !domain_suffix_matches(suffix, target_host)
+    {
+        return None;
     }
 
-    if let Some(cidr) = &rule.cidr {
-        if !cidr_matches(cidr, target_host) {
-            return None;
-        }
+    if let Some(cidr) = &rule.cidr
+        && !cidr_matches(cidr, target_host)
+    {
+        return None;
     }
 
     Some(rule.action)

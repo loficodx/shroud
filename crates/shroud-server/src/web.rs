@@ -1,34 +1,24 @@
-use crate::auth::validate_auth;
-use crate::relay::relay_tunnel;
 use crate::transport::http2::handle_http2_connection;
 use crate::transport::raw_tcp::{RawTcpServerState, handle_raw_tcp_connection};
 use crate::transport::tls::{TlsAlpn, build_tls_acceptor_with_alpn};
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use shroud_core::config::{ServerConfig, TransportMode};
 use shroud_core::tcp_handshake::RAW_TCP_MAGIC;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
-const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
-const NONCE_LEN: usize = 16;
-const NONCE_HEADER_LEN: usize = 22;
-const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +46,6 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         TlsAlpn::None
     };
     let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.tls, tls_alpn)?;
-    let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
     let raw_tcp_state = RawTcpServerState::with_relay_config(
         cfg.clients.clone(),
         cfg.timeouts,
@@ -87,7 +76,6 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
 
                 let cfg = cfg.clone();
                 let tls_acceptor = tls_acceptor.clone();
-                let nonce_cache = nonce_cache.clone();
                 let raw_tcp_state = raw_tcp_state.clone();
                 let permit = connection_slots
                     .clone()
@@ -127,7 +115,6 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                                     stream,
                                     peer,
                                     cfg,
-                                    nonce_cache,
                                     raw_tcp_state,
                                     accepted_protocol,
                                 )
@@ -148,7 +135,6 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
                             stream,
                             peer,
                             cfg,
-                            nonce_cache,
                             raw_tcp_state,
                             AcceptedProtocol::Unknown,
                         )
@@ -195,7 +181,6 @@ async fn handle_connection<S>(
     stream: S,
     peer: std::net::SocketAddr,
     cfg: ServerConfig,
-    nonce_cache: Arc<NonceCache>,
     raw_tcp_state: RawTcpServerState,
     accepted_protocol: AcceptedProtocol,
 ) -> Result<()>
@@ -217,22 +202,17 @@ where
             return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
         }
 
-        return handle_http_connection(stream, peer, cfg, nonce_cache).await;
+        return handle_http_connection(stream, cfg).await;
     }
 
     if http2_enabled && accepted_protocol == AcceptedProtocol::H2 {
         return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
     }
 
-    handle_http_connection(stream, peer, cfg, nonce_cache).await
+    handle_http_connection(stream, cfg).await
 }
 
-async fn handle_http_connection<S>(
-    mut stream: S,
-    peer: std::net::SocketAddr,
-    cfg: ServerConfig,
-    nonce_cache: Arc<NonceCache>,
-) -> Result<()>
+async fn handle_http_connection<S>(mut stream: S, cfg: ServerConfig) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -243,10 +223,6 @@ where
 
     if parsed.method == "GET" && parsed.path == "/api/status" {
         return serve_health_status(&mut stream).await;
-    }
-
-    if parsed.method == "POST" && parsed.path == cfg.tunnel_path {
-        return handle_tunnel_request(stream, peer, cfg, nonce_cache, parsed).await;
     }
 
     if parsed.method == "GET" || parsed.method == "HEAD" {
@@ -353,83 +329,6 @@ where
         false,
     )
     .await
-}
-
-async fn handle_tunnel_request<S>(
-    mut stream: S,
-    peer: std::net::SocketAddr,
-    cfg: ServerConfig,
-    nonce_cache: Arc<NonceCache>,
-    parsed: ParsedHttpRequest,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let http_upgrade_started = Instant::now();
-    let Some(client_id) = optional_header(&parsed.headers, "x-shroud-client-id") else {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("missing required header x-shroud-client-id");
-    };
-    let Some(timestamp_raw) = optional_header(&parsed.headers, "x-shroud-timestamp") else {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("missing required header x-shroud-timestamp");
-    };
-    let Some(nonce_raw) = optional_header(&parsed.headers, "x-shroud-nonce") else {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("missing required header x-shroud-nonce");
-    };
-    let Some(auth_tag) = optional_header(&parsed.headers, "x-shroud-auth") else {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("missing required header x-shroud-auth");
-    };
-
-    let timestamp = match timestamp_raw.parse::<i64>() {
-        Ok(timestamp) => timestamp,
-        Err(err) => {
-            write_error_response(&mut stream, 403, false).await?;
-            return Err(err).context("invalid x-shroud-timestamp header value");
-        }
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs() as i64;
-    if (now - timestamp).abs() > ALLOWED_TIMESTAMP_SKEW_SECS {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("timestamp outside allowed skew window");
-    }
-
-    let nonce = match decode_nonce(nonce_raw) {
-        Ok(nonce) => nonce,
-        Err(err) => {
-            write_error_response(&mut stream, 403, false).await?;
-            return Err(err);
-        }
-    };
-
-    if !validate_auth(&cfg.clients, client_id, &nonce, timestamp, auth_tag) {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("auth validation failed for client_id={client_id}");
-    }
-
-    if !nonce_cache.insert_unique(client_id, &nonce).await {
-        write_error_response(&mut stream, 403, false).await?;
-        bail!("replayed nonce for client_id={client_id}");
-    }
-
-    stream
-        .write_all(
-            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: shroud-tunnel\r\n\r\n",
-        )
-        .await?;
-    debug!(
-        %peer,
-        client_id,
-        http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed()),
-        "server HTTP upgrade accepted"
-    );
-    relay_tunnel(stream, peer).await?;
-    Ok(())
 }
 
 fn elapsed_millis(elapsed: Duration) -> u64 {
@@ -655,78 +554,6 @@ fn reason_phrase(status_code: u16) -> &'static str {
     }
 }
 
-fn decode_nonce(nonce_raw: &str) -> Result<Vec<u8>> {
-    if nonce_raw.len() != NONCE_HEADER_LEN {
-        bail!("invalid x-shroud-nonce length");
-    }
-
-    if !nonce_raw
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
-    {
-        bail!("invalid x-shroud-nonce format");
-    }
-
-    let nonce = STANDARD_NO_PAD
-        .decode(nonce_raw)
-        .context("invalid base64 nonce in x-shroud-nonce")?;
-    if nonce.len() != NONCE_LEN {
-        bail!("invalid x-shroud-nonce decoded length");
-    }
-
-    Ok(nonce)
-}
-
-#[derive(Clone, Eq)]
-struct NonceKey {
-    client_id: String,
-    nonce: Vec<u8>,
-}
-
-impl PartialEq for NonceKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.client_id == other.client_id && self.nonce == other.nonce
-    }
-}
-
-impl Hash for NonceKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.client_id.hash(state);
-        self.nonce.hash(state);
-    }
-}
-
-struct NonceCache {
-    ttl: Duration,
-    entries: Mutex<HashMap<NonceKey, Instant>>,
-}
-
-impl NonceCache {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            entries: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn insert_unique(&self, client_id: &str, nonce: &[u8]) -> bool {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_key, expires_at| *expires_at > now);
-
-        let key = NonceKey {
-            client_id: client_id.to_string(),
-            nonce: nonce.to_vec(),
-        };
-        if entries.contains_key(&key) {
-            return false;
-        }
-
-        entries.insert(key, now + self.ttl);
-        true
-    }
-}
-
 async fn read_http_headers<S>(stream: &mut S) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -748,7 +575,6 @@ where
 struct ParsedHttpRequest {
     method: String,
     path: String,
-    headers: HashMap<String, String>,
 }
 
 fn parse_http_request(raw_request: &str) -> Result<ParsedHttpRequest> {
@@ -769,27 +595,17 @@ fn parse_http_request(raw_request: &str) -> Result<ParsedHttpRequest> {
         .ok_or_else(|| anyhow!("missing path before query in request line"))?
         .to_string();
 
-    let mut headers = HashMap::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
 
-        let (name, value) = line
+        let (_name, _value) = line
             .split_once(':')
             .ok_or_else(|| anyhow!("invalid header line: {line}"))?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
 
-    Ok(ParsedHttpRequest {
-        method,
-        path,
-        headers,
-    })
-}
-
-fn optional_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
-    headers.get(name).map(String::as_str)
+    Ok(ParsedHttpRequest { method, path })
 }
 
 #[cfg(test)]
@@ -807,35 +623,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static TEMP_WEB_ROOT_ID: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn decode_nonce_accepts_16_byte_standard_base64_without_padding() {
-        let nonce = [7u8; NONCE_LEN];
-        let encoded = STANDARD_NO_PAD.encode(nonce);
-
-        assert_eq!(decode_nonce(&encoded).expect("decode nonce"), nonce);
-    }
-
-    #[test]
-    fn decode_nonce_rejects_padding() {
-        let nonce = [7u8; NONCE_LEN];
-        let encoded = base64::engine::general_purpose::STANDARD.encode(nonce);
-
-        assert!(decode_nonce(&encoded).is_err());
-    }
-
-    #[test]
-    fn decode_nonce_rejects_wrong_decoded_length() {
-        let nonce = [7u8; NONCE_LEN - 1];
-        let encoded = STANDARD_NO_PAD.encode(nonce);
-
-        assert!(decode_nonce(&encoded).is_err());
-    }
-
-    #[test]
-    fn decode_nonce_rejects_non_base64_header_chars() {
-        assert!(decode_nonce("!!!!!!!!!!!!!!invalid").is_err());
-    }
 
     #[tokio::test]
     async fn raw_tcp_sniff_times_out_when_prefix_stalls() {
@@ -857,7 +644,6 @@ mod tests {
         let web_root = TempWebRoot::new();
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
-        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -865,7 +651,6 @@ mod tests {
                 server,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
-                nonce_cache,
                 raw_tcp_state,
                 AcceptedProtocol::H2,
             )
@@ -898,7 +683,6 @@ mod tests {
         let web_root = TempWebRoot::new();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
-        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -906,7 +690,6 @@ mod tests {
                 server,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
-                nonce_cache,
                 raw_tcp_state,
                 AcceptedProtocol::H2,
             )
@@ -976,7 +759,6 @@ mod tests {
         let web_root = TempWebRoot::new();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let cfg = test_config(&web_root, vec![TransportMode::Http2]);
-        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -984,7 +766,6 @@ mod tests {
                 server,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
-                nonce_cache,
                 raw_tcp_state,
                 AcceptedProtocol::H2,
             )
@@ -1029,31 +810,6 @@ mod tests {
         result.expect("handler should use HTTP/1.1 fallback");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("{\"status\":\"ok\"}\n"));
-    }
-
-    #[tokio::test]
-    async fn nonce_cache_rejects_reuse_for_same_client() {
-        let cache = NonceCache::new(Duration::from_secs(60));
-
-        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
-        assert!(!cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
-    }
-
-    #[tokio::test]
-    async fn nonce_cache_allows_same_nonce_for_different_clients() {
-        let cache = NonceCache::new(Duration::from_secs(60));
-
-        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
-        assert!(cache.insert_unique("client-b", &[1u8; NONCE_LEN]).await);
-    }
-
-    #[tokio::test]
-    async fn nonce_cache_expires_entries() {
-        let cache = NonceCache::new(Duration::from_millis(1));
-
-        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
     }
 
     #[tokio::test]
@@ -1190,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_missing_auth_returns_neutral_403() {
+    async fn legacy_http_upgrade_tunnel_path_returns_404() {
         let web_root = TempWebRoot::new();
         web_root.write("index.html", b"fallback index");
 
@@ -1200,10 +956,7 @@ mod tests {
         )
         .await;
 
-        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(response.contains("<h1>Forbidden</h1>"));
-        assert!(!response.to_ascii_lowercase().contains("proxy"));
-        assert!(!response.to_ascii_lowercase().contains("shroud"));
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 
     struct TempWebRoot {
@@ -1243,9 +996,7 @@ mod tests {
     fn test_config(web_root: &TempWebRoot, modes: Vec<TransportMode>) -> ServerConfig {
         ServerConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            tunnel_path: "/api/tunnel".to_string(),
             web_root: web_root.path.to_string_lossy().into_owned(),
-            logging: Default::default(),
             transport: ServerTransportConfig { modes },
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),
@@ -1278,7 +1029,6 @@ mod tests {
     ) -> (String, Result<()>) {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let cfg = test_config(web_root, modes);
-        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -1286,7 +1036,6 @@ mod tests {
                 server,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
                 cfg,
-                nonce_cache,
                 raw_tcp_state,
                 accepted_protocol,
             )
@@ -1312,17 +1061,7 @@ mod tests {
     async fn run_request(web_root: &TempWebRoot, request: &str) -> String {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let cfg = test_config(web_root, vec![TransportMode::RawTcp]);
-        let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(60)));
-
-        let handle = tokio::spawn(async move {
-            handle_http_connection(
-                server,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
-                cfg,
-                nonce_cache,
-            )
-            .await
-        });
+        let handle = tokio::spawn(async move { handle_http_connection(server, cfg).await });
 
         client
             .write_all(request.as_bytes())

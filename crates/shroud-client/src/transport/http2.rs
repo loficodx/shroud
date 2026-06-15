@@ -9,10 +9,10 @@ use h2::client::SendRequest;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, StatusCode, Version};
 use shroud_core::auth::compute_auth_tag_bytes;
-use shroud_core::config::{ClientAuthConfig, OutboundConfig, TimeoutsConfig};
+use shroud_core::config::{ClientAuthConfig, TimeoutsConfig, TransportEndpointConfig};
 use shroud_core::http2_protocol::{
     DEFAULT_TUNNEL_PATH, HEADER_AUTH, HEADER_CLIENT_ID, HEADER_NONCE, HEADER_TARGET_HOST,
-    HEADER_TARGET_PORT, HEADER_TIMESTAMP, LEGACY_TUNNEL_PATH,
+    HEADER_TARGET_PORT, HEADER_TIMESTAMP,
 };
 use std::io;
 use std::net::Ipv6Addr;
@@ -39,7 +39,7 @@ const H2_CONNECTION_POOL_SIZE: usize = 4;
 
 #[derive(Clone)]
 pub struct Http2Transport {
-    outbound: OutboundConfig,
+    outbound: TransportEndpointConfig,
     auth: ClientAuthConfig,
     tls: Http2Tls,
     timeouts: Http2ClientTimeouts,
@@ -100,7 +100,7 @@ pub struct H2StreamIo {
 
 impl Http2Transport {
     pub fn with_timeouts(
-        outbound: OutboundConfig,
+        outbound: TransportEndpointConfig,
         auth: ClientAuthConfig,
         timeouts: TimeoutsConfig,
     ) -> Result<Self> {
@@ -387,7 +387,7 @@ impl Http2ConnectionPool {
 }
 
 impl Http2Tls {
-    fn new(outbound: &OutboundConfig) -> Result<Self> {
+    fn new(outbound: &TransportEndpointConfig) -> Result<Self> {
         let connector = TlsConnector::from(Arc::new(build_http2_tls_client_config(outbound)?));
         let server_name = outbound
             .tls_server_name
@@ -591,7 +591,7 @@ fn build_http2_auth_headers(auth: &ClientAuthConfig) -> Result<Http2AuthHeaders>
     })
 }
 
-fn tunnel_uri(outbound: &OutboundConfig) -> Result<http::Uri> {
+fn tunnel_uri(outbound: &TransportEndpointConfig) -> Result<http::Uri> {
     let scheme = if outbound.tls { "https" } else { "http" };
     let path = http2_tunnel_path(outbound);
     http::Uri::builder()
@@ -602,15 +602,11 @@ fn tunnel_uri(outbound: &OutboundConfig) -> Result<http::Uri> {
         .context("failed to build HTTP/2 tunnel URI")
 }
 
-fn http2_tunnel_path(outbound: &OutboundConfig) -> &str {
-    if outbound.path.trim().is_empty() || outbound.path == LEGACY_TUNNEL_PATH {
-        DEFAULT_TUNNEL_PATH
-    } else {
-        &outbound.path
-    }
+fn http2_tunnel_path(outbound: &TransportEndpointConfig) -> &str {
+    outbound.path.as_deref().unwrap_or(DEFAULT_TUNNEL_PATH)
 }
 
-fn http_authority(outbound: &OutboundConfig) -> String {
+fn http_authority(outbound: &TransportEndpointConfig) -> String {
     let host = outbound
         .tls_server_name
         .as_deref()
@@ -648,12 +644,12 @@ mod tests {
         }
     }
 
-    fn outbound_config() -> OutboundConfig {
-        OutboundConfig {
+    fn outbound_config() -> TransportEndpointConfig {
+        TransportEndpointConfig {
             server: "localhost".to_string(),
             port: 443,
             tls: true,
-            ..OutboundConfig::default()
+            ..TransportEndpointConfig::default()
         }
     }
 

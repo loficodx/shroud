@@ -1,113 +1,35 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    pub inbound: Option<SocksInboundConfig>,
+    #[serde(default)]
     pub inbounds: ClientInboundsConfig,
     pub transport: TransportConfig,
-    pub outbound: OutboundConfig,
+    #[serde(default)]
     pub auth: ClientAuthConfig,
+    #[serde(default)]
     pub timeouts: TimeoutsConfig,
+    #[serde(default)]
     pub relay: RelayConfig,
+    #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
     pub dns: ClientDnsConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(skip_serializing)]
-    transport_source: TransportConfigSource,
-    #[serde(skip_serializing)]
-    transport_compat_warnings: Vec<String>,
-}
-
-impl<'de> Deserialize<'de> for ClientConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = ClientConfigRaw::deserialize(deserializer)?;
-
-        let mut inbounds: ClientInboundsConfig = raw.inbounds.unwrap_or_default().into();
-        if let Some(legacy_socks) = raw.inbound {
-            inbounds.socks = Some(legacy_socks);
-        }
-
-        let inbound = inbounds.socks.clone();
-
-        let legacy_outbound = raw
-            .outbound
-            .or_else(|| raw.outbounds.and_then(|outbounds| outbounds.proxy));
-
-        let (transport, outbound, transport_source, transport_compat_warnings) =
-            match (raw.transport, legacy_outbound) {
-                (Some(transport), Some(_)) => (
-                    transport.clone(),
-                    OutboundConfig::from_transport(&transport),
-                    TransportConfigSource::Transport,
-                    vec![
-                        "outbound config is deprecated and ignored when transport is set"
-                            .to_string(),
-                    ],
-                ),
-                (Some(transport), None) => (
-                    transport.clone(),
-                    OutboundConfig::from_transport(&transport),
-                    TransportConfigSource::Transport,
-                    Vec::new(),
-                ),
-                (None, Some(outbound)) => (
-                    TransportConfig::from_legacy_outbound(&outbound),
-                    outbound.clone(),
-                    TransportConfigSource::LegacyOutbound,
-                    legacy_outbound_warnings(&outbound),
-                ),
-                (None, None) => (
-                    TransportConfig::default(),
-                    OutboundConfig::default(),
-                    TransportConfigSource::Default,
-                    Vec::new(),
-                ),
-            };
-
-        let auth = raw.auth.unwrap_or_default();
-
-        let timeouts = raw.timeouts.unwrap_or_default();
-        let relay = raw.relay.unwrap_or_default();
-        let limits = raw.limits.unwrap_or_default();
-        let routing = raw.routing.unwrap_or_default();
-        let dns = raw.dns.unwrap_or_default();
-        let logging = raw.logging.unwrap_or_default();
-
-        Ok(Self {
-            inbound,
-            inbounds,
-            transport,
-            outbound,
-            auth,
-            timeouts,
-            relay,
-            limits,
-            routing,
-            dns,
-            logging,
-            transport_source,
-            transport_compat_warnings,
-        })
-    }
-}
-
-impl ClientConfig {
-    pub fn transport_compat_warnings(&self) -> &[String] {
-        &self.transport_compat_warnings
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SocksInboundConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -115,6 +37,7 @@ pub struct SocksInboundConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ClientInboundsConfig {
     #[serde(default)]
     pub socks: Option<SocksInboundConfig>,
@@ -133,6 +56,7 @@ impl ClientInboundsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TunInboundConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -161,51 +85,27 @@ impl Default for TunInboundConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutboundConfig {
-    #[serde(default)]
+#[derive(Debug, Clone, Default)]
+pub struct TransportEndpointConfig {
     pub server: String,
-    #[serde(default)]
     pub port: u16,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
     pub tls: bool,
-    #[serde(default)]
     pub tls_server_name: Option<String>,
-    #[serde(default)]
     pub tls_ca_cert_path: Option<String>,
-    #[serde(default)]
     pub tls_server_cert_sha256: Option<String>,
+    pub path: Option<String>,
 }
 
-impl Default for OutboundConfig {
-    fn default() -> Self {
-        Self {
-            server: String::new(),
-            port: 0,
-            path: String::new(),
-            tls: false,
-            tls_server_name: None,
-            tls_ca_cert_path: None,
-            tls_server_cert_sha256: None,
-        }
-    }
-}
-
-impl OutboundConfig {
-    fn from_transport(transport: &TransportConfig) -> Self {
+impl From<&TransportConfig> for TransportEndpointConfig {
+    fn from(transport: &TransportConfig) -> Self {
         Self {
             server: transport.server.clone(),
             port: transport.port,
-            path: transport
-                .path
-                .clone()
-                .unwrap_or_else(default_legacy_tunnel_path),
             tls: transport.tls,
             tls_server_name: transport.tls_server_name.clone(),
             tls_ca_cert_path: transport.tls_ca_cert_path.clone(),
             tls_server_cert_sha256: transport.tls_server_cert_sha256.clone(),
+            path: transport.path.clone(),
         }
     }
 }
@@ -225,6 +125,7 @@ impl Default for TransportMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_mode")]
     pub mode: TransportMode,
@@ -328,27 +229,8 @@ impl Default for TransportConfig {
     }
 }
 
-impl TransportConfig {
-    fn from_legacy_outbound(outbound: &OutboundConfig) -> Self {
-        Self {
-            mode: default_mode(),
-            server: outbound.server.clone(),
-            port: outbound.port,
-            tls: outbound.tls,
-            tls_server_name: outbound.tls_server_name.clone(),
-            tls_ca_cert_path: outbound.tls_ca_cert_path.clone(),
-            tls_server_cert_sha256: outbound.tls_server_cert_sha256.clone(),
-            path: (!outbound.path.is_empty()).then(|| outbound.path.clone()),
-        }
-    }
-}
-
 fn default_mode() -> TransportMode {
     TransportMode::RawTcp
-}
-
-fn default_legacy_tunnel_path() -> String {
-    "/api/tunnel".to_string()
 }
 
 fn default_server_connect_ms() -> u64 {
@@ -383,27 +265,8 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn legacy_outbound_warnings(outbound: &OutboundConfig) -> Vec<String> {
-    let mut warnings = vec![
-        "outbound config is deprecated; use transport.mode, transport.server, and transport.port"
-            .to_string(),
-    ];
-    if !outbound.path.is_empty() {
-        warnings.push(
-            "outbound.path with custom HTTP Upgrade is deprecated and will be removed".to_string(),
-        );
-    }
-    warnings
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportConfigSource {
-    Transport,
-    LegacyOutbound,
-    Default,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuthConfig {
     #[serde(default)]
     pub client_id: String,
@@ -412,6 +275,7 @@ pub struct ClientAuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientDnsConfig {
     #[serde(default = "default_true")]
     pub remote_by_default: bool,
@@ -432,6 +296,7 @@ impl Default for ClientDnsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     #[serde(default = "default_route_action")]
     pub default: RouteAction,
@@ -440,8 +305,8 @@ pub struct RoutingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingRule {
-    #[serde(alias = "outbound")]
     pub action: RouteAction,
     #[serde(default)]
     pub domain: Option<String>,
@@ -488,14 +353,11 @@ impl Default for RouteAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
-    #[serde(default = "default_legacy_tunnel_path")]
-    pub tunnel_path: String,
     #[serde(default)]
     pub web_root: String,
-    #[serde(default)]
-    pub logging: LoggingConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
     #[serde(default)]
@@ -513,6 +375,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerTransportConfig {
     #[serde(default = "default_server_modes")]
     pub modes: Vec<TransportMode>,
@@ -531,6 +394,7 @@ fn default_server_modes() -> Vec<TransportMode> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSecurityConfig {
     #[serde(default = "default_true")]
     pub deny_private_ips: bool,
@@ -548,6 +412,7 @@ impl Default for ServerSecurityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerTlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -558,6 +423,7 @@ pub struct ServerTlsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizedClient {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -661,17 +527,18 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
     if !config.inbounds.has_enabled_inbound() {
         errors.push(ConfigFieldError::new(
             "inbounds",
-            "expected at least one enabled inbound: inbound, inbounds.socks, or inbounds.tun",
+            "expected at least one enabled inbound: inbounds.socks or inbounds.tun",
         ));
     }
 
-    if let Some(socks) = &config.inbounds.socks {
-        if socks.enabled && socks.listen.port() == 0 {
-            errors.push(ConfigFieldError::new(
-                "inbounds.socks.listen",
-                "port must be greater than 0",
-            ));
-        }
+    if let Some(socks) = &config.inbounds.socks
+        && socks.enabled
+        && socks.listen.port() == 0
+    {
+        errors.push(ConfigFieldError::new(
+            "inbounds.socks.listen",
+            "port must be greater than 0",
+        ));
     }
 
     if config.inbounds.tun.enabled {
@@ -689,14 +556,7 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
         }
     }
 
-    match config.transport_source {
-        TransportConfigSource::Transport => {
-            validate_transport_config(&mut errors, "transport", &config.transport);
-        }
-        TransportConfigSource::LegacyOutbound | TransportConfigSource::Default => {
-            validate_outbound_config(&mut errors, &config.outbound);
-        }
-    }
+    validate_transport_config(&mut errors, "transport", &config.transport);
     validate_client_auth_config(&mut errors, "auth", &config.auth);
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
     validate_relay_config(&mut errors, "relay", &config.relay);
@@ -716,7 +576,6 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
             "port must be greater than 0",
         ));
     }
-    validate_http_path(&mut errors, "tunnel_path", &config.tunnel_path);
     validate_non_empty(&mut errors, "web_root", &config.web_root);
     if !config.web_root.trim().is_empty() {
         let web_root = Path::new(&config.web_root);
@@ -763,7 +622,6 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_server_security_config(&mut errors, "security", &config.security);
-    validate_logging_config(&mut errors, "logging", &config.logging);
 
     finish_validation(errors)
 }
@@ -857,8 +715,21 @@ fn validate_transport_config(
             "port must be greater than 0",
         ));
     }
-    if let Some(path) = &transport.path {
-        validate_http_path(errors, &format!("{base_path}.path"), path);
+    match transport.mode {
+        TransportMode::RawTcp => {
+            if transport.path.is_some() {
+                errors.push(ConfigFieldError::new(
+                    format!("{base_path}.path"),
+                    "is only supported for http2 transport",
+                ));
+            }
+        }
+        TransportMode::Http2 => {
+            if let Some(path) = &transport.path {
+                validate_http_path(errors, &format!("{base_path}.path"), path);
+            }
+        }
+        TransportMode::Http3 => {}
     }
     if transport.tls {
         if let Some(server_name) = &transport.tls_server_name {
@@ -937,60 +808,6 @@ fn validate_server_security_config(
             errors.push(ConfigFieldError::new(
                 format!("{base_path}.allow_ports[{index}]"),
                 "port must be greater than 0",
-            ));
-        }
-    }
-}
-
-fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &OutboundConfig) {
-    validate_non_empty(errors, "outbound.server", &outbound.server);
-    if outbound.port == 0 {
-        errors.push(ConfigFieldError::new(
-            "outbound.port",
-            "port must be greater than 0",
-        ));
-    }
-    validate_http_path(errors, "outbound.path", &outbound.path);
-    if outbound.tls {
-        if let Some(server_name) = &outbound.tls_server_name {
-            validate_non_empty(errors, "outbound.tls_server_name", server_name);
-            if server_name.contains('/') || server_name.contains(':') {
-                errors.push(ConfigFieldError::new(
-                    "outbound.tls_server_name",
-                    "must be a DNS name or IP address, not a URL",
-                ));
-            }
-        }
-        if let Some(path) = &outbound.tls_ca_cert_path {
-            if path.trim().is_empty() {
-                errors.push(ConfigFieldError::new(
-                    "outbound.tls_ca_cert_path",
-                    "must not be empty",
-                ));
-            } else {
-                validate_file_path(errors, "outbound.tls_ca_cert_path", path);
-            }
-        }
-        if outbound.tls_ca_cert_path.is_some() && outbound.tls_server_cert_sha256.is_some() {
-            errors.push(ConfigFieldError::new(
-                "outbound.tls_server_cert_sha256",
-                "must not be used together with outbound.tls_ca_cert_path",
-            ));
-        }
-        if let Some(pin) = &outbound.tls_server_cert_sha256 {
-            validate_sha256_hex(errors, "outbound.tls_server_cert_sha256", pin);
-        }
-    } else {
-        if outbound.tls_ca_cert_path.is_some() {
-            errors.push(ConfigFieldError::new(
-                "outbound.tls_ca_cert_path",
-                "requires tls=true",
-            ));
-        }
-        if outbound.tls_server_cert_sha256.is_some() {
-            errors.push(ConfigFieldError::new(
-                "outbound.tls_server_cert_sha256",
-                "requires tls=true",
             ));
         }
     }
@@ -1173,66 +990,6 @@ fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
     Some((network, prefix_len))
 }
 
-#[derive(Debug, Deserialize)]
-struct ClientConfigRaw {
-    #[serde(default)]
-    inbound: Option<SocksInboundConfig>,
-    #[serde(default)]
-    inbounds: Option<ClientInboundsRaw>,
-    #[serde(default)]
-    transport: Option<TransportConfig>,
-    #[serde(default)]
-    outbound: Option<OutboundConfig>,
-    #[serde(default)]
-    outbounds: Option<ClientOutboundsRaw>,
-    #[serde(default)]
-    auth: Option<ClientAuthConfig>,
-    #[serde(default)]
-    timeouts: Option<TimeoutsConfig>,
-    #[serde(default)]
-    relay: Option<RelayConfig>,
-    #[serde(default)]
-    limits: Option<LimitsConfig>,
-    #[serde(default)]
-    routing: Option<RoutingConfig>,
-    #[serde(default)]
-    dns: Option<ClientDnsConfig>,
-    #[serde(default)]
-    logging: Option<LoggingConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientInboundsRaw {
-    #[serde(default)]
-    socks: Option<SocksInboundConfig>,
-    #[serde(default)]
-    tun: TunInboundConfig,
-}
-
-impl Default for ClientInboundsRaw {
-    fn default() -> Self {
-        Self {
-            socks: None,
-            tun: TunInboundConfig::default(),
-        }
-    }
-}
-
-impl From<ClientInboundsRaw> for ClientInboundsConfig {
-    fn from(raw: ClientInboundsRaw) -> Self {
-        Self {
-            socks: raw.socks,
-            tun: raw.tun,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientOutboundsRaw {
-    #[serde(default)]
-    proxy: Option<OutboundConfig>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,21 +997,9 @@ mod tests {
     const VALID_PIN: &str = "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
 
     const BASE_CLIENT_CONFIG: &str = r#"
-inbound:
-  listen: "127.0.0.1:1080"
-outbound:
-  server: "127.0.0.1"
-  port: 8443
-  path: "/api/tunnel"
-  tls: true
-auth:
-  client_id: "11111111-1111-1111-1111-111111111111"
-  client_secret: "secret"
-"#;
-
-    const BASE_CLIENT_TRANSPORT_CONFIG: &str = r#"
-inbound:
-  listen: "127.0.0.1:1080"
+inbounds:
+  socks:
+    listen: "127.0.0.1:1080"
 transport:
   mode: raw_tcp
   server: "127.0.0.1"
@@ -1265,11 +1010,14 @@ auth:
   client_secret: "secret"
 "#;
 
+    const BASE_CLIENT_TRANSPORT_CONFIG: &str = BASE_CLIENT_CONFIG;
+
     fn client_transport_config_with_tls(tls: bool, extra_transport: &str) -> String {
         format!(
             r#"
-inbound:
-  listen: "127.0.0.1:1080"
+inbounds:
+  socks:
+    listen: "127.0.0.1:1080"
 transport:
   mode: raw_tcp
   server: "127.0.0.1"
@@ -1295,11 +1043,6 @@ transport:
         assert_eq!(cfg.transport.port, 8443);
         assert!(cfg.transport.tls);
         assert!(cfg.transport.path.is_none());
-        assert!(cfg.transport_compat_warnings().is_empty());
-
-        assert_eq!(cfg.outbound.server, "127.0.0.1");
-        assert_eq!(cfg.outbound.port, 8443);
-        assert_eq!(cfg.outbound.path, "/api/tunnel");
         assert_eq!(cfg.timeouts.server_connect_ms, 10_000);
         assert_eq!(cfg.timeouts.tls_handshake_ms, 10_000);
         assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
@@ -1338,10 +1081,6 @@ transport:
 
         assert_eq!(
             cfg.transport.tls_server_cert_sha256.as_deref(),
-            Some(VALID_PIN)
-        );
-        assert_eq!(
-            cfg.outbound.tls_server_cert_sha256.as_deref(),
             Some(VALID_PIN)
         );
     }
@@ -1405,7 +1144,7 @@ transport:
     }
 
     #[test]
-    fn client_config_maps_legacy_outbound_cert_pin_to_transport() {
+    fn client_config_accepts_transport_cert_pin() {
         let raw = BASE_CLIENT_CONFIG.replace(
             "  tls: true",
             &format!("  tls: true\n  tls_server_cert_sha256: \"{VALID_PIN}\""),
@@ -1498,29 +1237,19 @@ transport:
 
         assert_eq!(cfg.transport.mode, TransportMode::Http2);
         assert_eq!(cfg.transport.path.as_deref(), Some("/api/v1/events"));
-        assert_eq!(cfg.outbound.path, "/api/v1/events");
     }
 
     #[test]
-    fn client_config_maps_legacy_outbound_to_transport_with_warnings() {
-        let cfg = load_client_config_yaml(BASE_CLIENT_CONFIG).expect("valid config");
-
-        assert_eq!(cfg.transport.mode, TransportMode::RawTcp);
-        assert_eq!(cfg.transport.server, "127.0.0.1");
-        assert_eq!(cfg.transport.port, 8443);
-        assert_eq!(cfg.transport.path.as_deref(), Some("/api/tunnel"));
-
-        let warnings = cfg.transport_compat_warnings();
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("outbound config is deprecated"))
+    fn client_config_rejects_raw_tcp_transport_path() {
+        let raw = BASE_CLIENT_TRANSPORT_CONFIG.replace(
+            "mode: raw_tcp\n  server",
+            "mode: raw_tcp\n  path: \"/api/tunnel/h2\"\n  server",
         );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("outbound.path"))
-        );
+
+        let err = load_client_config_yaml(&raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("transport.path"));
+        assert!(err.to_string().contains("only supported for http2"));
     }
 
     #[test]
@@ -1536,7 +1265,6 @@ transport:
     fn server_config_accepts_transport_modes() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 transport:
   modes:
@@ -1559,7 +1287,6 @@ clients:
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
         assert!(cfg.security.deny_private_ips);
         assert!(cfg.security.allow_ports.is_empty());
-        assert_eq!(cfg.logging.level, "info");
     }
 
     #[test]
@@ -1572,46 +1299,25 @@ clients:
     }
 
     #[test]
-    fn server_config_accepts_logging_level_override() {
+    fn server_config_rejects_legacy_tunnel_path_field() {
         let raw = r#"
 listen: "127.0.0.1:8443"
 tunnel_path: "/api/tunnel"
 web_root: "."
-logging:
-  level: warn
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "secret"
 "#;
 
-        let cfg = load_server_config_yaml(raw).expect("valid config");
+        let err = load_server_config_yaml(raw).expect_err("legacy tunnel_path must be rejected");
 
-        assert_eq!(cfg.logging.level, "warn");
-    }
-
-    #[test]
-    fn server_config_rejects_invalid_logging_level() {
-        let raw = r#"
-listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
-web_root: "."
-logging:
-  level: verbose
-clients:
-  - client_id: "11111111-1111-1111-1111-111111111111"
-    client_secret: "secret"
-"#;
-
-        let err = load_server_config_yaml(raw).expect_err("invalid config");
-
-        assert!(err.to_string().contains("logging.level"));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
     fn server_config_accepts_limit_overrides() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 limits:
   max_concurrent_connections: 128
@@ -1629,7 +1335,6 @@ clients:
     fn server_config_rejects_zero_connection_limit() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 limits:
   max_concurrent_connections: 0
@@ -1650,7 +1355,6 @@ clients:
     fn server_config_accepts_relay_buffer_overrides() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 relay:
   upload_buffer_size: 16384
@@ -1670,7 +1374,6 @@ clients:
     fn server_config_rejects_zero_relay_buffer() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 relay:
   download_buffer_size: 0
@@ -1688,7 +1391,6 @@ clients:
     fn server_config_accepts_security_acl_overrides() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 security:
   deny_private_ips: false
@@ -1710,7 +1412,6 @@ clients:
     fn server_config_rejects_zero_acl_port() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 security:
   allow_ports:
@@ -1729,7 +1430,6 @@ clients:
     fn server_config_rejects_reserved_transport_modes() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "/api/tunnel"
 web_root: "."
 transport:
   modes:
@@ -1767,22 +1467,51 @@ clients:
     }
 
     #[test]
-    fn client_config_normalizes_legacy_inbound_into_inbounds_socks() {
-        let cfg: ClientConfig = serde_yaml::from_str(BASE_CLIENT_CONFIG).expect("parse config");
+    fn client_config_rejects_legacy_inbound_field() {
+        let raw = BASE_CLIENT_CONFIG.replace(
+            "inbounds:\n  socks:\n    listen: \"127.0.0.1:1080\"",
+            "inbound:\n  listen: \"127.0.0.1:1080\"",
+        );
 
-        let legacy = cfg.inbound.expect("legacy inbound alias");
-        let socks = cfg.inbounds.socks.expect("normalized socks inbound");
+        let err = load_client_config_yaml(&raw).expect_err("legacy inbound must be rejected");
 
-        assert!(legacy.enabled);
-        assert_eq!(legacy.listen.to_string(), "127.0.0.1:1080");
-        assert!(socks.enabled);
-        assert_eq!(socks.listen.to_string(), "127.0.0.1:1080");
-        assert!(!cfg.inbounds.tun.enabled);
-        assert_eq!(cfg.inbounds.tun.name, "tun0");
-        assert_eq!(cfg.inbounds.tun.address, "10.10.0.2/24");
-        assert_eq!(cfg.inbounds.tun.mtu, 1400);
-        assert!(!cfg.inbounds.tun.auto_route);
-        assert!(cfg.inbounds.tun.dns.is_none());
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn client_config_rejects_legacy_outbound_field() {
+        let raw = BASE_CLIENT_CONFIG.replace(
+            "transport:\n  mode: raw_tcp\n  server: \"127.0.0.1\"\n  port: 8443\n  tls: true",
+            "outbound:\n  server: \"127.0.0.1\"\n  port: 8443\n  path: \"/api/tunnel\"\n  tls: true",
+        );
+
+        let err = load_client_config_yaml(&raw).expect_err("legacy outbound must be rejected");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn client_config_rejects_legacy_outbounds_field() {
+        let raw = BASE_CLIENT_CONFIG.replace(
+            "transport:\n  mode: raw_tcp\n  server: \"127.0.0.1\"\n  port: 8443\n  tls: true",
+            "outbounds:\n  proxy:\n    server: \"127.0.0.1\"\n    port: 8443\n    path: \"/api/tunnel\"\n    tls: true",
+        );
+
+        let err = load_client_config_yaml(&raw).expect_err("legacy outbounds must be rejected");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn client_config_rejects_legacy_routing_outbound_alias() {
+        let raw = format!(
+            "{BASE_CLIENT_CONFIG}\nrouting:\n  rules:\n    - outbound: direct\n      domain_suffix: \".local\"\n"
+        );
+
+        let err =
+            load_client_config_yaml(&raw).expect_err("legacy routing outbound must be rejected");
+
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -1791,10 +1520,10 @@ clients:
 inbounds:
   socks:
     listen: "127.0.0.1:1081"
-outbound:
+transport:
+  mode: raw_tcp
   server: "127.0.0.1"
   port: 8443
-  path: "/api/tunnel"
   tls: true
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -1806,7 +1535,6 @@ auth:
 
         assert!(socks.enabled);
         assert_eq!(socks.listen.to_string(), "127.0.0.1:1081");
-        assert!(cfg.inbound.is_some());
     }
 
     #[test]
@@ -1820,10 +1548,10 @@ inbounds:
     mtu: 1300
     auto_route: true
     dns: "10.20.0.53"
-outbound:
+transport:
+  mode: raw_tcp
   server: "127.0.0.1"
   port: 8443
-  path: "/api/tunnel"
   tls: true
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -1832,7 +1560,6 @@ auth:
 
         let cfg: ClientConfig = serde_yaml::from_str(raw).expect("parse config");
 
-        assert!(cfg.inbound.is_none());
         assert!(cfg.inbounds.socks.is_none());
         assert!(cfg.inbounds.tun.enabled);
         assert_eq!(cfg.inbounds.tun.name, "tun-test0");
@@ -1852,10 +1579,10 @@ inbounds:
   socks:
     enabled: false
     listen: "127.0.0.1:1080"
-outbound:
+transport:
+  mode: raw_tcp
   server: "127.0.0.1"
   port: 8443
-  path: "/api/tunnel"
   tls: true
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -1872,10 +1599,10 @@ auth:
 inbounds:
   socks:
     listen: "127.0.0.1:1080"
-outbound:
+transport:
+  mode: raw_tcp
   server: "127.0.0.1"
-  port: 8443
-  path: "api/tunnel"
+  port: 0
   tls: true
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -1888,7 +1615,7 @@ routing:
         let err = load_client_config_yaml(raw).expect_err("invalid config");
         let message = err.to_string();
 
-        assert!(message.contains("outbound.path"));
+        assert!(message.contains("transport.port"));
         assert!(message.contains("auth.client_secret"));
         assert!(message.contains("routing.rules[0].cidr"));
     }
@@ -1897,7 +1624,6 @@ routing:
     fn server_config_validation_reports_field_paths() {
         let raw = r#"
 listen: "127.0.0.1:8443"
-tunnel_path: "api/tunnel"
 web_root: "."
 tls:
   enabled: true
@@ -1908,7 +1634,6 @@ clients:
         let err = load_server_config_yaml(raw).expect_err("invalid config");
         let message = err.to_string();
 
-        assert!(message.contains("tunnel_path"));
         assert!(message.contains("tls.cert_path"));
         assert!(message.contains("tls.key_path"));
         assert!(message.contains("clients[0].client_secret"));

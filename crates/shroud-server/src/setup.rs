@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rcgen::CertifiedKey;
 use sha2::{Digest, Sha256};
 use shroud_core::config::{
-    AuthorizedClient, LoggingConfig, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
-    TimeoutsConfig, generate_client_credentials,
+    AuthorizedClient, ServerConfig, ServerSecurityConfig, ServerTlsConfig, TimeoutsConfig,
+    generate_client_credentials,
 };
 use shroud_core::import::{ImportConnection, encode_import_connection};
 use std::fs;
@@ -388,9 +388,7 @@ fn read_existing_server_config(path: &Path) -> Result<ServerConfig> {
 fn default_server_config(port: u16) -> ServerConfig {
     ServerConfig {
         listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-        tunnel_path: "/api/tunnel".to_string(),
         web_root: "./web".to_string(),
-        logging: LoggingConfig::default(),
         transport: Default::default(),
         tls: ServerTlsConfig::default(),
         timeouts: TimeoutsConfig::default(),
@@ -530,10 +528,10 @@ fn read_first_cert_der(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn resolve_server_arg(server: Option<String>, config: &ServerConfig) -> Result<String> {
-    if let Some(server) = server {
-        if !server.trim().is_empty() {
-            return Ok(server);
-        }
+    if let Some(server) = server
+        && !server.trim().is_empty()
+    {
+        return Ok(server);
     }
     if config.listen.ip().is_unspecified() {
         bail!("--server is required");
@@ -795,7 +793,6 @@ mod tests {
             format!(
                 r#"
 listen: "127.0.0.1:9443"
-tunnel_path: "/api/tunnel"
 web_root: "./web"
 transport:
   modes:
@@ -852,7 +849,6 @@ clients:
             format!(
                 r#"
 listen: "127.0.0.1:9443"
-tunnel_path: "/api/tunnel"
 web_root: "./web"
 transport:
   modes:

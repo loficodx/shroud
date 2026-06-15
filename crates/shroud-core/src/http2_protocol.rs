@@ -1,5 +1,4 @@
 pub const DEFAULT_TUNNEL_PATH: &str = "/api/tunnel/h2";
-pub const LEGACY_TUNNEL_PATH: &str = "/api/tunnel";
 
 pub const HEADER_CLIENT_ID: &str = "x-shroud-client-id";
 pub const HEADER_TIMESTAMP: &str = "x-shroud-timestamp";

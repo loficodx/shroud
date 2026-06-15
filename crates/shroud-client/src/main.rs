@@ -1,30 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use shroud_client::{routing, session, socks5, transport, tun};
-use shroud_core::config::{LoggingConfig, load_client_config_yaml};
+use shroud_core::config::{LoggingConfig, TransportEndpointConfig, load_client_config_yaml};
 use shroud_core::import::{decode_import_connection, render_client_yaml_from_import};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-// cargo run -p shroud-client --release client-laptop.yaml
-
-//DNS remote resolve
-// curl --socks5-hostname 127.0.0.1:1080 https://example.com
-
-//DNS leak
-//curl -v --socks5 127.0.0.1:1080 https://example.com/
-
-//TUN TEST
-// cd /home/laptop/Projects/shroud
-// sudo SHROUD_SMOKE_BUILD=0 ./scripts/tun-smoke-linux.sh
-
-//TUN TEST BUILD
-// cd /home/laptop/Projects/shroud
-// cargo build -p shroud-client -p shroud-server
-// sudo SHROUD_SMOKE_BUILD=0 ./scripts/tun-smoke-linux.sh
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = Cli::parse().into_command()?;
@@ -47,9 +31,6 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
     let cfg = load_client_config_yaml(&raw)
         .with_context(|| format!("failed to load client config: {}", config_path.display()))?;
     init_tracing(log_format, &cfg.logging);
-    for warning in cfg.transport_compat_warnings() {
-        warn!(warning = %warning, "deprecated client transport config");
-    }
     info!(
         mode = ?cfg.transport.mode,
         server = %cfg.transport.server,
@@ -58,9 +39,9 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
         "selected TCP transport mode"
     );
 
-    let mut outbound = cfg.outbound.clone();
+    let mut endpoint = TransportEndpointConfig::from(&cfg.transport);
     if cfg.inbounds.tun.enabled && cfg.inbounds.tun.auto_route {
-        outbound = tun::route::prepare_auto_route_outbound(outbound)?;
+        endpoint = tun::route::prepare_auto_route_outbound(endpoint)?;
     }
 
     let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
@@ -68,7 +49,7 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
     if cfg.inbounds.tun.enabled {
         let tcp_transport = transport::build_tcp_transport(
             cfg.transport.mode,
-            outbound.clone(),
+            endpoint.clone(),
             cfg.auth.clone(),
             cfg.timeouts,
         )
@@ -90,7 +71,7 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
             "TUN device opened; starting smoltcp-backed packet engine"
         );
         let _route_guard =
-            tun::route::setup_before_packet_engine(device.name(), &cfg.inbounds.tun, &outbound)?;
+            tun::route::setup_before_packet_engine(device.name(), &cfg.inbounds.tun, &endpoint)?;
         let fake_dns = tun::dns::FakeDns::new();
         let fake_dns_addr = tun::dns::listen_addr(&cfg.inbounds.tun);
         info!(
@@ -122,7 +103,7 @@ async fn run_client(config_path: PathBuf, log_format: LogFormat) -> Result<()> {
 
     let tcp_transport = transport::build_tcp_transport(
         cfg.transport.mode,
-        outbound.clone(),
+        endpoint.clone(),
         cfg.auth.clone(),
         cfg.timeouts,
     )

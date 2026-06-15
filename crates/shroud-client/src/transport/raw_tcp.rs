@@ -3,7 +3,7 @@ use crate::transport::{BoxedIo, TcpTransport, TcpTransportConnect, TcpTransportM
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::BoxFuture;
 use shroud_core::auth::compute_auth_tag_bytes;
-use shroud_core::config::{ClientAuthConfig, OutboundConfig, TimeoutsConfig};
+use shroud_core::config::{ClientAuthConfig, TimeoutsConfig, TransportEndpointConfig};
 use shroud_core::tcp_handshake::{
     ClientAuthProof, TcpConnectRequest, TcpConnectStatus, read_raw_tcp_connect_status,
     write_raw_tcp_connect_request,
@@ -17,7 +17,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 
 #[derive(Clone)]
 pub struct RawTcpTransport {
-    outbound: OutboundConfig,
+    outbound: TransportEndpointConfig,
     auth: ClientAuthConfig,
     tls: Option<RawTcpTls>,
     timeouts: RawTcpClientTimeouts,
@@ -38,7 +38,7 @@ struct RawTcpClientTimeouts {
 
 impl RawTcpTransport {
     pub fn with_timeouts(
-        outbound: OutboundConfig,
+        outbound: TransportEndpointConfig,
         auth: ClientAuthConfig,
         timeouts: TimeoutsConfig,
     ) -> Result<Self> {
@@ -71,7 +71,7 @@ impl RawTcpTransport {
 }
 
 impl RawTcpTls {
-    fn new(outbound: &OutboundConfig) -> Result<Self> {
+    fn new(outbound: &TransportEndpointConfig) -> Result<Self> {
         let connector = TlsConnector::from(Arc::new(build_tls_client_config(outbound)?));
         let server_name = outbound
             .tls_server_name
@@ -109,7 +109,7 @@ impl TcpTransport for RawTcpTransport {
 }
 
 async fn connect_raw_tcp_with_cached_tls(
-    outbound: &OutboundConfig,
+    outbound: &TransportEndpointConfig,
     auth: &ClientAuthConfig,
     tls: Option<&RawTcpTls>,
     timeouts: RawTcpClientTimeouts,
@@ -246,12 +246,12 @@ mod tests {
         }
     }
 
-    fn outbound_config(port: u16) -> OutboundConfig {
-        OutboundConfig {
+    fn outbound_config(port: u16) -> TransportEndpointConfig {
+        TransportEndpointConfig {
             server: "127.0.0.1".to_string(),
             port,
             tls: false,
-            ..OutboundConfig::default()
+            ..TransportEndpointConfig::default()
         }
     }
 

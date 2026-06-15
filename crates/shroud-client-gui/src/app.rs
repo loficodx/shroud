@@ -56,7 +56,7 @@ impl ShroudGuiApp {
             Ok(configs) => {
                 self.configs = configs;
                 self.selected_config = selected_path
-                    .and_then(|path| self.configs.iter().position(|config| &config.path == path));
+                    .and_then(|path| self.configs.iter().position(|config| config.path == path));
                 self.expanded_config = None;
 
                 if let Some(index) = self.selected_config {
@@ -491,10 +491,10 @@ fn yaml_value_by_paths(raw_yaml: &str, paths: &[&[&str]]) -> Option<String> {
     let value: serde_yaml::Value = serde_yaml::from_str(raw_yaml).ok()?;
 
     for path in paths {
-        if let Some(value) = yaml_value_at_path(&value, path) {
-            if let Some(text) = yaml_scalar_to_string(value) {
-                return Some(text);
-            }
+        if let Some(value) = yaml_value_at_path(&value, path)
+            && let Some(text) = yaml_scalar_to_string(value)
+        {
+            return Some(text);
         }
     }
 

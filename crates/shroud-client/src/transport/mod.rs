@@ -4,7 +4,9 @@ pub(crate) mod tls;
 
 use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
-use shroud_core::config::{ClientAuthConfig, OutboundConfig, TimeoutsConfig, TransportMode};
+use shroud_core::config::{
+    ClientAuthConfig, TimeoutsConfig, TransportEndpointConfig, TransportMode,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -35,7 +37,7 @@ pub trait TcpTransport: Send + Sync {
 
 pub fn build_tcp_transport(
     mode: TransportMode,
-    outbound: OutboundConfig,
+    outbound: TransportEndpointConfig,
     auth: ClientAuthConfig,
     timeouts: TimeoutsConfig,
 ) -> Result<Arc<dyn TcpTransport>> {

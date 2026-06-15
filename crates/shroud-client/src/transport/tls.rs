@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use shroud_core::config::OutboundConfig;
+use shroud_core::config::TransportEndpointConfig;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::File;
@@ -23,17 +23,19 @@ pub(crate) enum TlsAlpn {
     Http2,
 }
 
-pub(crate) fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+pub(crate) fn build_tls_client_config(outbound: &TransportEndpointConfig) -> Result<ClientConfig> {
     build_tls_client_config_with_alpn(outbound, TlsAlpn::None)
 }
 
 #[allow(dead_code)]
-pub(crate) fn build_http2_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+pub(crate) fn build_http2_tls_client_config(
+    outbound: &TransportEndpointConfig,
+) -> Result<ClientConfig> {
     build_tls_client_config_with_alpn(outbound, TlsAlpn::Http2)
 }
 
 pub(crate) fn build_tls_client_config_with_alpn(
-    outbound: &OutboundConfig,
+    outbound: &TransportEndpointConfig,
     alpn: TlsAlpn,
 ) -> Result<ClientConfig> {
     let config = if let Some(pin) = &outbound.tls_server_cert_sha256 {
@@ -53,7 +55,7 @@ fn apply_alpn(mut config: ClientConfig, alpn: TlsAlpn) -> ClientConfig {
     config
 }
 
-fn build_root_store_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+fn build_root_store_tls_client_config(outbound: &TransportEndpointConfig) -> Result<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -176,12 +178,12 @@ impl StdError for PinMismatch {}
 mod tests {
     use super::*;
 
-    fn outbound_config() -> OutboundConfig {
-        OutboundConfig {
+    fn outbound_config() -> TransportEndpointConfig {
+        TransportEndpointConfig {
             server: "localhost".to_string(),
             port: 443,
             tls: true,
-            ..OutboundConfig::default()
+            ..TransportEndpointConfig::default()
         }
     }
 
