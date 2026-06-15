@@ -438,6 +438,7 @@ async fn start_tunnel_server_with_modes(modes: Vec<TransportMode>) -> TestResult
     let cfg = ServerConfig {
         listen: addr,
         web_root: "./web".to_string(),
+        logging: Default::default(),
         transport: ServerTransportConfig { modes },
         tls: ServerTlsConfig {
             enabled: true,

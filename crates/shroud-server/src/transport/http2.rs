@@ -706,6 +706,7 @@ mod tests {
         Arc::new(ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             web_root: ".".to_string(),
+            logging: Default::default(),
             transport: ServerTransportConfig {
                 modes: vec![TransportMode::Http2],
             },

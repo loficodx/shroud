@@ -997,6 +997,7 @@ mod tests {
         ServerConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             web_root: web_root.path.to_string_lossy().into_owned(),
+            logging: Default::default(),
             transport: ServerTransportConfig { modes },
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),

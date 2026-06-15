@@ -359,6 +359,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub web_root: String,
     #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
     pub transport: ServerTransportConfig,
     #[serde(default)]
     pub tls: ServerTlsConfig,
@@ -621,6 +623,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
+    validate_logging_config(&mut errors, "logging", &config.logging);
     validate_server_security_config(&mut errors, "security", &config.security);
 
     finish_validation(errors)
@@ -1285,8 +1288,43 @@ clients:
         assert_eq!(cfg.relay.upload_buffer_size, 65_536);
         assert_eq!(cfg.relay.download_buffer_size, 65_536);
         assert_eq!(cfg.limits.max_concurrent_connections, 4096);
+        assert_eq!(cfg.logging.level, "info");
         assert!(cfg.security.deny_private_ips);
         assert!(cfg.security.allow_ports.is_empty());
+    }
+
+    #[test]
+    fn server_config_accepts_logging_level_override() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+web_root: "."
+logging:
+  level: debug
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn server_config_rejects_invalid_logging_level() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+web_root: "."
+logging:
+  level: verbose
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let err = load_server_config_yaml(raw).expect_err("invalid config");
+
+        assert!(err.to_string().contains("logging.level"));
     }
 
     #[test]

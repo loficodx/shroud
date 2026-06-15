@@ -228,6 +228,8 @@ Example server config:
 ```yaml
 listen: "0.0.0.0:8443"
 web_root: "./web"
+logging:
+  level: "info"
 transport:
   modes:
     - raw_tcp
@@ -258,7 +260,7 @@ clients:
 
 `security.allow_ports: []` means no port allowlist is enforced. If the list is non-empty, only those target ports are allowed.
 
-Client `logging.level` controls runtime log verbosity for `shroud-client`. Supported values are `trace`, `debug`, `info`, `warn`, `error`, and `off`; `RUST_LOG` is not used for the client log level.
+Client and server `logging.level` control runtime log verbosity for `shroud-client` and `shroud-server run`. Supported values are `trace`, `debug`, `info`, `warn`, `error`, and `off`; `RUST_LOG` is not used for the configured log level.
 
 ## Server Setup
 

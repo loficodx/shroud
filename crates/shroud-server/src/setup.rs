@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rcgen::CertifiedKey;
 use sha2::{Digest, Sha256};
 use shroud_core::config::{
-    AuthorizedClient, ServerConfig, ServerSecurityConfig, ServerTlsConfig, TimeoutsConfig,
-    generate_client_credentials,
+    AuthorizedClient, LoggingConfig, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
+    TimeoutsConfig, generate_client_credentials,
 };
 use shroud_core::fs_util::create_parent_dir;
 use shroud_core::import::{ImportConnection, encode_import_connection};
@@ -390,6 +390,7 @@ fn default_server_config(port: u16) -> ServerConfig {
     ServerConfig {
         listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
         web_root: "./web".to_string(),
+        logging: LoggingConfig::default(),
         transport: Default::default(),
         tls: ServerTlsConfig::default(),
         timeouts: TimeoutsConfig::default(),

@@ -39,7 +39,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to read server config: {}", config_path.display()))?;
     let cfg = load_server_config_yaml(&raw)
         .with_context(|| format!("failed to load server config: {}", config_path.display()))?;
-    init_tracing(&LoggingConfig::default());
+    init_tracing(&cfg.logging);
 
     info!(
         listen = %cfg.listen,
