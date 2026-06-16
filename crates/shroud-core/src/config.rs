@@ -361,8 +361,6 @@ pub struct ServerConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
-    pub transport: ServerTransportConfig,
-    #[serde(default)]
     pub tls: ServerTlsConfig,
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
@@ -374,25 +372,6 @@ pub struct ServerConfig {
     pub security: ServerSecurityConfig,
     #[serde(default)]
     pub clients: Vec<AuthorizedClient>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerTransportConfig {
-    #[serde(default = "default_server_modes")]
-    pub modes: Vec<TransportMode>,
-}
-
-impl Default for ServerTransportConfig {
-    fn default() -> Self {
-        Self {
-            modes: default_server_modes(),
-        }
-    }
-}
-
-fn default_server_modes() -> Vec<TransportMode> {
-    vec![TransportMode::RawTcp]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,7 +598,6 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
         validate_authorized_client_config(&mut errors, &format!("clients[{index}]"), client);
     }
     validate_unique_authorized_client_names(&mut errors, &config.clients);
-    validate_server_transport_config(&mut errors, "transport", &config.transport);
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
@@ -775,28 +753,6 @@ fn validate_transport_config(
                 format!("{base_path}.tls_server_cert_sha256"),
                 "requires tls=true",
             ));
-        }
-    }
-}
-
-fn validate_server_transport_config(
-    errors: &mut Vec<ConfigFieldError>,
-    base_path: &str,
-    transport: &ServerTransportConfig,
-) {
-    if transport.modes.is_empty() {
-        errors.push(ConfigFieldError::new(
-            format!("{base_path}.modes"),
-            "must include at least one TCP transport mode",
-        ));
-    }
-    for mode in &transport.modes {
-        match mode {
-            TransportMode::RawTcp | TransportMode::Http2 => {}
-            TransportMode::Http3 => errors.push(ConfigFieldError::new(
-                format!("{base_path}.modes"),
-                "http3 transport is reserved but not implemented yet",
-            )),
         }
     }
 }
@@ -1265,14 +1221,10 @@ transport:
     }
 
     #[test]
-    fn server_config_accepts_transport_modes() {
+    fn server_config_does_not_require_transport_modes() {
         let raw = r#"
 listen: "127.0.0.1:8443"
 web_root: "."
-transport:
-  modes:
-    - raw_tcp
-    - http2
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "secret"
@@ -1280,10 +1232,6 @@ clients:
 
         let cfg = load_server_config_yaml(raw).expect("valid config");
 
-        assert_eq!(
-            cfg.transport.modes,
-            vec![TransportMode::RawTcp, TransportMode::Http2]
-        );
         assert_eq!(cfg.timeouts.raw_tcp_handshake_ms, 5_000);
         assert_eq!(cfg.relay.upload_buffer_size, 65_536);
         assert_eq!(cfg.relay.download_buffer_size, 65_536);
@@ -1328,12 +1276,9 @@ clients:
     }
 
     #[test]
-    fn sample_server_config_enables_http2_mode() {
-        let cfg: ServerConfig = serde_yaml::from_str(include_str!("../../../configs/server.yaml"))
+    fn sample_server_config_is_valid_without_transport_modes() {
+        let _cfg: ServerConfig = serde_yaml::from_str(include_str!("../../../configs/server.yaml"))
             .expect("parse sample server config");
-
-        assert!(cfg.transport.modes.contains(&TransportMode::RawTcp));
-        assert!(cfg.transport.modes.contains(&TransportMode::Http2));
     }
 
     #[test]
@@ -1462,25 +1407,6 @@ clients:
         let err = load_server_config_yaml(raw).expect_err("invalid config");
 
         assert!(err.to_string().contains("security.allow_ports[0]"));
-    }
-
-    #[test]
-    fn server_config_rejects_reserved_transport_modes() {
-        let raw = r#"
-listen: "127.0.0.1:8443"
-web_root: "."
-transport:
-  modes:
-    - raw_tcp
-    - http3
-clients:
-  - client_id: "11111111-1111-1111-1111-111111111111"
-    client_secret: "secret"
-"#;
-
-        let err = load_server_config_yaml(raw).expect_err("invalid config");
-
-        assert!(err.to_string().contains("http3 transport is reserved"));
     }
 
     #[test]

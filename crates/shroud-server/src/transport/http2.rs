@@ -694,8 +694,7 @@ fn format_target(host: &str, port: u16) -> String {
 mod tests {
     use super::*;
     use shroud_core::config::{
-        AuthorizedClient, RelayConfig, ServerSecurityConfig, ServerTlsConfig,
-        ServerTransportConfig, TimeoutsConfig, TransportMode,
+        AuthorizedClient, RelayConfig, ServerSecurityConfig, ServerTlsConfig, TimeoutsConfig,
     };
     use tokio::time::timeout;
 
@@ -707,9 +706,6 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             web_root: ".".to_string(),
             logging: Default::default(),
-            transport: ServerTransportConfig {
-                modes: vec![TransportMode::Http2],
-            },
             tls: ServerTlsConfig::default(),
             timeouts: TimeoutsConfig::default(),
             relay: RelayConfig::default(),

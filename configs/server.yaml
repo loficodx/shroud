@@ -2,10 +2,6 @@ listen: "0.0.0.0:8443"
 web_root: "./web"
 logging:
   level: "debug"
-transport:
-  modes:
-    - raw_tcp
-    - http2
 tls:
   enabled: true
   cert_path: "certs/server.crt"

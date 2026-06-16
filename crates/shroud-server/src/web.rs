@@ -1,8 +1,8 @@
 use crate::transport::http2::handle_http2_connection;
 use crate::transport::raw_tcp::{RawTcpServerState, handle_raw_tcp_connection};
-use crate::transport::tls::{TlsAlpn, build_tls_acceptor_with_alpn};
+use crate::transport::tls::build_tls_acceptor_with_alpn;
 use anyhow::{Context, Result, anyhow, bail};
-use shroud_core::config::{ServerConfig, TransportMode};
+use shroud_core::config::ServerConfig;
 use shroud_core::tcp_handshake::RAW_TCP_MAGIC;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -40,12 +40,7 @@ impl AcceptedProtocol {
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
-    let tls_alpn = if cfg.transport.modes.contains(&TransportMode::Http2) {
-        TlsAlpn::Http2
-    } else {
-        TlsAlpn::None
-    };
-    let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.tls, tls_alpn)?;
+    let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.tls)?;
     let raw_tcp_state = RawTcpServerState::with_relay_config(
         cfg.clients.clone(),
         cfg.timeouts,
@@ -187,25 +182,17 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let raw_tcp_enabled = cfg.transport.modes.contains(&TransportMode::RawTcp);
-    let http2_enabled = cfg.transport.modes.contains(&TransportMode::Http2);
-    if raw_tcp_enabled {
-        let (stream, is_raw_tcp) = sniff_raw_tcp_magic(
-            stream,
-            Duration::from_millis(cfg.timeouts.raw_tcp_handshake_ms),
-        )
-        .await?;
-        if is_raw_tcp {
-            return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
-        }
-        if http2_enabled && accepted_protocol == AcceptedProtocol::H2 {
-            return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
-        }
+    let (stream, is_raw_tcp) = sniff_raw_tcp_magic(
+        stream,
+        Duration::from_millis(cfg.timeouts.raw_tcp_handshake_ms),
+    )
+    .await?;
 
-        return handle_http_connection(stream, cfg).await;
+    if is_raw_tcp {
+        return handle_raw_tcp_connection(stream, peer, raw_tcp_state).await;
     }
 
-    if http2_enabled && accepted_protocol == AcceptedProtocol::H2 {
+    if accepted_protocol == AcceptedProtocol::H2 {
         return handle_http2_connection(stream, peer, Arc::new(cfg)).await;
     }
 
@@ -611,10 +598,7 @@ fn parse_http_request(raw_request: &str) -> Result<ParsedHttpRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shroud_core::config::{
-        AuthorizedClient, ServerSecurityConfig, ServerTlsConfig, ServerTransportConfig,
-        TransportMode,
-    };
+    use shroud_core::config::{AuthorizedClient, ServerSecurityConfig, ServerTlsConfig};
     use shroud_core::tcp_handshake::{TcpConnectStatus, read_raw_tcp_connect_status};
     use std::fs as std_fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -640,10 +624,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_dispatches_raw_magic_to_raw_tcp_when_http2_is_enabled() {
+    async fn handle_connection_dispatches_raw_magic_to_raw_tcp() {
         let web_root = TempWebRoot::new();
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
+        let cfg = test_config(&web_root);
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -682,7 +666,7 @@ mod tests {
     async fn handle_connection_dispatches_non_raw_tcp_prefix_to_http2_with_h2_protocol() {
         let web_root = TempWebRoot::new();
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let cfg = test_config(&web_root, vec![TransportMode::RawTcp, TransportMode::Http2]);
+        let cfg = test_config(&web_root);
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -719,13 +703,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_dispatches_http1_to_fallback_when_raw_tcp_and_http2_enabled() {
+    async fn handle_connection_dispatches_http1_to_fallback() {
         let web_root = TempWebRoot::new();
         web_root.write("index.html", b"fallback index");
 
         let (response, result) = run_dispatch_http_request(
             &web_root,
-            vec![TransportMode::RawTcp, TransportMode::Http2],
             AcceptedProtocol::Http1,
             "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -737,13 +720,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_dispatches_raw_tcp_only_http1_request_to_http_fallback() {
+    async fn handle_connection_dispatches_unknown_protocol_to_http_fallback() {
         let web_root = TempWebRoot::new();
         web_root.write("index.html", b"fallback index");
 
         let (response, result) = run_dispatch_http_request(
             &web_root,
-            vec![TransportMode::RawTcp],
             AcceptedProtocol::Unknown,
             "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -755,10 +737,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_dispatches_http2_only_h2_protocol_to_http2() {
+    async fn handle_connection_dispatches_h2_protocol_to_http2() {
         let web_root = TempWebRoot::new();
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let cfg = test_config(&web_root, vec![TransportMode::Http2]);
+        let cfg = test_config(&web_root);
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -792,24 +774,6 @@ mod tests {
 
         connection.await.unwrap();
         handle.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn handle_connection_dispatches_unknown_protocol_to_http_fallback() {
-        let web_root = TempWebRoot::new();
-        web_root.write("index.html", b"fallback index");
-
-        let (response, result) = run_dispatch_http_request(
-            &web_root,
-            vec![TransportMode::Http2],
-            AcceptedProtocol::Unknown,
-            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        )
-        .await;
-
-        result.expect("handler should use HTTP/1.1 fallback");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.ends_with("{\"status\":\"ok\"}\n"));
     }
 
     #[tokio::test]
@@ -960,7 +924,7 @@ mod tests {
     }
 
     struct TempWebRoot {
-        path: std::path::PathBuf,
+        path: PathBuf,
     }
 
     impl TempWebRoot {
@@ -993,12 +957,11 @@ mod tests {
         }
     }
 
-    fn test_config(web_root: &TempWebRoot, modes: Vec<TransportMode>) -> ServerConfig {
+    fn test_config(web_root: &TempWebRoot) -> ServerConfig {
         ServerConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             web_root: web_root.path.to_string_lossy().into_owned(),
             logging: Default::default(),
-            transport: ServerTransportConfig { modes },
             tls: ServerTlsConfig::default(),
             timeouts: Default::default(),
             relay: Default::default(),
@@ -1024,12 +987,11 @@ mod tests {
 
     async fn run_dispatch_http_request(
         web_root: &TempWebRoot,
-        modes: Vec<TransportMode>,
         accepted_protocol: AcceptedProtocol,
         request: &str,
     ) -> (String, Result<()>) {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let cfg = test_config(web_root, modes);
+        let cfg = test_config(web_root);
         let raw_tcp_state = test_raw_tcp_state(&cfg);
 
         let handle = tokio::spawn(async move {
@@ -1061,7 +1023,7 @@ mod tests {
 
     async fn run_request(web_root: &TempWebRoot, request: &str) -> String {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
-        let cfg = test_config(web_root, vec![TransportMode::RawTcp]);
+        let cfg = test_config(web_root);
         let handle = tokio::spawn(async move { handle_http_connection(server, cfg).await });
 
         client

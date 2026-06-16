@@ -2,9 +2,9 @@
 
 Shroud is an experimental Rust client/server TCP tunneling project.
 
-The current implementation is centered on **raw TCP CONNECT tunneling**: `shroud-client` accepts local SOCKS5 `CONNECT` traffic or Linux TUN TCP streams, opens a per-connection `raw_tcp` tunnel to `shroud-server`, authenticates the client, asks the server to connect to the requested target, and then relays raw bytes in both directions. TLS can wrap the client/server connection.
+The current implementation supports raw TCP CONNECT tunneling and HTTP/2 tunneling: `shroud-client` accepts local SOCKS5 `CONNECT` traffic or Linux TUN TCP streams, opens a tunnel to `shroud-server`, authenticates the client, asks the server to connect to the requested target, and then relays raw bytes in both directions. TLS can wrap the client/server connection.
 
-The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer accurate for the refactored code path. `raw_tcp` is the default and only implemented transport mode. `http2` and `http3` are reserved in config/types but rejected as not implemented.
+The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer accurate for the refactored code path. `raw_tcp` is the default client transport mode. `http3` is reserved in config/types but rejected as not implemented.
 
 ## Current Status
 
@@ -49,11 +49,14 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
   - optional denial of private, loopback, and link-local target IPs with `security.deny_private_ips`;
   - optional port allowlist with `security.allow_ports`;
   - remote DNS lookup on the server for domain targets.
-- Server web code:
+- Server listener and web code:
+  - always accepts all implemented inbound protocols on the same listener;
+  - `raw_tcp` over TLS, selected by the `SHRD` raw TCP magic bytes;
+  - HTTP/2 over TLS, selected by ALPN `h2`;
+  - HTTP/1.1 fallback for `/api/status` and static files;
   - `GET /api/status` handler;
   - static fallback from `web_root`;
   - neutral 403/404 responses;
-  - note: with the current valid `transport.modes: [raw_tcp]` server mode, non-`raw_tcp` connections are rejected before the HTTP handler is reached.
 - Client GUI:
   - discovers `client*.yaml` in the repository root and `configs/client*.yaml`;
   - validates client configs before saving or starting;
@@ -92,7 +95,6 @@ The older framed HTTP Upgrade tunnel and multiplexing documentation is no longer
 - Per-stream multiplex flow control.
 - Active client HTTP/1.1 Upgrade transport.
 - WebSocket transport.
-- HTTP/2 transport.
 - HTTP/3 / QUIC transport.
 - Browser DoH/DoT interception.
 - Server-side egress IP selection.
@@ -225,14 +227,17 @@ routing:
 
 Example server config:
 
+The server always accepts all implemented inbound protocols on the same listener:
+
+- `raw_tcp` over TLS, selected by `SHRD` raw TCP magic bytes;
+- HTTP/2 over TLS, selected by ALPN `h2`;
+- HTTP/1.1 fallback for `/api/status` and static files.
+
 ```yaml
 listen: "0.0.0.0:8443"
 web_root: "./web"
 logging:
   level: "info"
-transport:
-  modes:
-    - raw_tcp
 tls:
   enabled: true
   cert_path: "certs/server.crt"

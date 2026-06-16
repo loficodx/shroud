@@ -41,11 +41,7 @@ async fn run_server(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to load server config: {}", config_path.display()))?;
     init_tracing(&cfg.logging);
 
-    info!(
-        listen = %cfg.listen,
-        modes = ?cfg.transport.modes,
-        "starting shroud server"
-    );
+    info!(listen = %cfg.listen, "starting shroud server");
     web::serve(cfg).await
 }
 

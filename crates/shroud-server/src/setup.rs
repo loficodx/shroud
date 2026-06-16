@@ -3,7 +3,7 @@ use rcgen::CertifiedKey;
 use sha2::{Digest, Sha256};
 use shroud_core::config::{
     AuthorizedClient, LoggingConfig, ServerConfig, ServerSecurityConfig, ServerTlsConfig,
-    TimeoutsConfig, generate_client_credentials,
+    TimeoutsConfig, TransportMode, generate_client_credentials,
 };
 use shroud_core::fs_util::create_parent_dir;
 use shroud_core::import::{ImportConnection, encode_import_connection};
@@ -391,7 +391,6 @@ fn default_server_config(port: u16) -> ServerConfig {
         listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
         web_root: "./web".to_string(),
         logging: LoggingConfig::default(),
-        transport: Default::default(),
         tls: ServerTlsConfig::default(),
         timeouts: TimeoutsConfig::default(),
         relay: Default::default(),
@@ -614,24 +613,13 @@ fn import_connection_for_client(
         name: client.name.clone(),
         server: server.to_string(),
         port,
-        mode: server_transport_mode(config)?,
+        mode: TransportMode::RawTcp,
         tls: config.tls.enabled,
         tls_server_name: Some(server.to_string()),
         tls_server_cert_sha256: fingerprint_sha256_hex(cert_der),
         client_id: client.client_id.clone(),
         client_secret: client.client_secret.clone(),
     })
-}
-
-fn server_transport_mode(config: &ServerConfig) -> Result<shroud_core::config::TransportMode> {
-    config
-        .transport
-        .modes
-        .iter()
-        .copied()
-        .find(|mode| *mode == shroud_core::config::TransportMode::RawTcp)
-        .or_else(|| config.transport.modes.first().copied())
-        .ok_or_else(|| anyhow!("server transport.modes must include at least one mode"))
 }
 
 pub fn fingerprint_sha256_hex(der: &[u8]) -> String {
@@ -785,9 +773,6 @@ mod tests {
                 r#"
 listen: "127.0.0.1:9443"
 web_root: "./web"
-transport:
-  modes:
-    - raw_tcp
 tls:
   enabled: true
   cert_path: "{cert_path_string}"
@@ -841,9 +826,6 @@ clients:
                 r#"
 listen: "127.0.0.1:9443"
 web_root: "./web"
-transport:
-  modes:
-    - raw_tcp
 tls:
   enabled: true
   cert_path: "{cert_path_string}"

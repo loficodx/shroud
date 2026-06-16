@@ -6,8 +6,8 @@ use shroud_client::transport::TcpTransport;
 use shroud_client::transport::raw_tcp::RawTcpTransport;
 use shroud_core::config::{
     AuthorizedClient, ClientAuthConfig, ClientDnsConfig, RouteAction, RoutingConfig, RoutingRule,
-    ServerConfig, ServerSecurityConfig, ServerTlsConfig, ServerTransportConfig, TimeoutsConfig,
-    TransportEndpointConfig, TransportMode,
+    ServerConfig, ServerSecurityConfig, ServerTlsConfig, TimeoutsConfig, TransportEndpointConfig,
+    TransportMode,
 };
 use shroud_server::web;
 use std::net::SocketAddr;
@@ -119,8 +119,7 @@ async fn curl_socks5_hostname_smoke_relays_to_target() -> TestResult {
 #[tokio::test]
 async fn http2_socks_tls_tunnel_relays_multiple_requests_to_target() -> TestResult {
     let target = start_http_target("shroud http2 smoke ok").await?;
-    let server =
-        start_tunnel_server_with_modes(vec![TransportMode::RawTcp, TransportMode::Http2]).await?;
+    let server = start_tunnel_server().await?;
     let client = start_socks_client_with_mode(
         server.addr,
         RoutingConfig {
@@ -430,16 +429,11 @@ async fn dns_policy_can_block_ip_targets() -> TestResult {
 }
 
 async fn start_tunnel_server() -> TestResult<RunningTask> {
-    start_tunnel_server_with_modes(vec![TransportMode::RawTcp]).await
-}
-
-async fn start_tunnel_server_with_modes(modes: Vec<TransportMode>) -> TestResult<RunningTask> {
     let addr = free_addr().await?;
     let cfg = ServerConfig {
         listen: addr,
         web_root: "./web".to_string(),
         logging: Default::default(),
-        transport: ServerTransportConfig { modes },
         tls: ServerTlsConfig {
             enabled: true,
             cert_path: Some(SERVER_CERT.to_string()),

@@ -7,16 +7,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TlsAlpn {
-    None,
-    Http2,
-}
-
-pub(crate) fn build_tls_acceptor_with_alpn(
-    tls: &ServerTlsConfig,
-    alpn: TlsAlpn,
-) -> Result<Option<TlsAcceptor>> {
+pub(crate) fn build_tls_acceptor_with_alpn(tls: &ServerTlsConfig) -> Result<Option<TlsAcceptor>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -36,16 +27,13 @@ pub(crate) fn build_tls_acceptor_with_alpn(
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("failed to build tls server config")?;
-    let config = apply_alpn(config, alpn);
+    let config = configure_http2_alpn(config);
 
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
 
-fn apply_alpn(mut config: RustlsServerConfig, alpn: TlsAlpn) -> RustlsServerConfig {
-    config.alpn_protocols = match alpn {
-        TlsAlpn::None => Vec::new(),
-        TlsAlpn::Http2 => vec![b"h2".to_vec()],
-    };
+fn configure_http2_alpn(mut config: RustlsServerConfig) -> RustlsServerConfig {
+    config.alpn_protocols = vec![b"h2".to_vec()];
     config
 }
 
@@ -82,7 +70,7 @@ mod tests {
             .with_cert_resolver(Arc::new(
                 tokio_rustls::rustls::server::ResolvesServerCertUsingSni::new(),
             ));
-        let config = apply_alpn(config, TlsAlpn::Http2);
+        let config = configure_http2_alpn(config);
 
         assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
     }
@@ -91,10 +79,6 @@ mod tests {
     fn disabled_tls_acceptor_stays_disabled_with_http2_alpn() {
         let tls = ServerTlsConfig::default();
 
-        assert!(
-            build_tls_acceptor_with_alpn(&tls, TlsAlpn::Http2)
-                .unwrap()
-                .is_none()
-        );
+        assert!(build_tls_acceptor_with_alpn(&tls).unwrap().is_none());
     }
 }
