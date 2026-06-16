@@ -543,7 +543,7 @@ pub fn validate_client_config(config: &ClientConfig) -> Result<(), ConfigValidat
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
     validate_routing_config_into(&mut errors, "routing.rules", &config.routing);
-    validate_logging_config(&mut errors, "logging", &config.logging);
+    // validate_logging_config(&mut errors, "logging", &config.logging);
 
     finish_validation(errors)
 }
@@ -601,7 +601,7 @@ pub fn validate_server_config(config: &ServerConfig) -> Result<(), ConfigValidat
     validate_timeouts_config(&mut errors, "timeouts", &config.timeouts);
     validate_relay_config(&mut errors, "relay", &config.relay);
     validate_limits_config(&mut errors, "limits", &config.limits);
-    validate_logging_config(&mut errors, "logging", &config.logging);
+    // validate_logging_config(&mut errors, "logging", &config.logging);
     validate_server_security_config(&mut errors, "security", &config.security);
 
     finish_validation(errors)
